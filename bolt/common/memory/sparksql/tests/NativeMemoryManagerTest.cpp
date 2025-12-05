@@ -1,0 +1,103 @@
+/*
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <arrow/memory_pool.h>
+#include <folly/Random.h>
+#include <gtest/gtest.h>
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <exception>
+#include <list>
+#include <memory>
+#include <numeric>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include "bolt/common/base/BoltException.h"
+#include "bolt/common/base/Exceptions.h"
+#include "bolt/common/base/SuccinctPrinter.h"
+#include "bolt/common/base/tests/GTestUtils.h"
+#include "bolt/common/memory/sparksql/AllocationListener.h"
+#include "bolt/common/memory/sparksql/MemoryConsumer.h"
+#include "bolt/common/memory/sparksql/MemoryTarget.h"
+#include "bolt/common/memory/sparksql/Spiller.h"
+#include "bolt/common/memory/sparksql/SpillerPhase.h"
+#include "bolt/common/memory/sparksql/TaskMemoryManager.h"
+
+#include "bolt/common/memory/sparksql/NativeMemoryManagerFactory.h"
+
+using namespace ::testing;
+using namespace bytedance::bolt::memory::sparksql;
+namespace bytedance::bolt::memory::sparksql {
+
+class NativeMemoryManagerTest : public testing::Test {
+ protected:
+  folly::Random::DefaultGenerator rng_;
+};
+
+TEST_F(NativeMemoryManagerTest, basic) {
+  const int64_t capacity = 1 * 1024 * 1024 * 1024;
+  const int64_t taskAttemptId = 996;
+
+  auto memoryPool = std::make_shared<ExecutionMemoryPool>();
+  memoryPool->setPoolSize(capacity);
+
+  auto tmm = std::make_shared<TaskMemoryManager>(memoryPool, taskAttemptId);
+
+  NativeMemoryManagerFactoryParam param{
+      .name = "TEST",
+      .memoryIsolation = false,
+      .conservativeTaskOffHeapMemorySize = 0,
+      .overAcquiredRatio = 0.3,
+      .taskMemoryManager = tmm,
+      .sessionConf = {}};
+
+  auto ans = NativeMemoryManagerFactory::contextInstance(param);
+  auto boltMemoryManager = ans->getManager();
+  auto pool = boltMemoryManager->getLeafMemoryPool();
+  arrow::MemoryPool* arrowPool = boltMemoryManager->getArrowMemoryPool();
+
+  int64_t allocTimes = 100000;
+
+  std::vector<std::pair<void*, int64_t>> allocMem(allocTimes);
+  std::vector<std::pair<uint8_t*, int64_t>> arrowAllocMem(allocTimes);
+
+  for (int i = 0; i < allocTimes; ++i) {
+    int64_t allocSize = folly::Random::rand32(1, 10000, rng_);
+    allocMem[i] = std::make_pair(pool->allocate(allocSize), allocSize);
+
+    uint8_t* out;
+    arrowPool->Allocate(allocSize, &out);
+    arrowAllocMem[i] = std::make_pair(out, allocSize);
+
+    std::memset(allocMem[i].first, '1', allocSize);
+    std::memset(out, '0', allocSize);
+  }
+  LOG(INFO) << "memoryUsed=" << memoryPool->memoryUsed();
+
+  for (int i = 0; i < allocTimes; ++i) {
+    pool->free(allocMem[i].first, allocMem[i].second);
+    arrowPool->Free(arrowAllocMem[i].first, arrowAllocMem[i].second);
+  }
+
+  boltMemoryManager->shrink(memoryPool->memoryUsed());
+  LOG(INFO) << "memoryUsed=" << memoryPool->memoryUsed();
+}
+
+} // namespace bytedance::bolt::memory::sparksql

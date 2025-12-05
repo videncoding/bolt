@@ -1,0 +1,86 @@
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# --------------------------------------------------------------------------
+# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified by ByteDance Ltd. and/or its affiliates on
+# 2025-11-11.
+#
+# Original file was released under the Apache License 2.0,
+# with the full license text available at:
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# This modified file is released under the same license.
+# --------------------------------------------------------------------------
+
+
+add_library(bolt_temp_path TempFilePath.cpp TempDirectoryPath.cpp)
+
+target_link_libraries(bolt_temp_path bolt_exception)
+
+add_library(
+  bolt_exec_test_lib
+  AssertQueryBuilder.cpp
+  ArbitratorTestUtil.cpp
+  Cursor.cpp
+  HiveConnectorTestBase.cpp
+  LocalExchangeSource.cpp
+  OperatorTestBase.cpp
+  PlanBuilder.cpp
+  QueryAssertions.cpp
+  SumNonPODAggregate.cpp
+  TpchQueryBuilder.cpp
+  VectorTestUtil.cpp
+  PortUtil.cpp
+  RowBasedSerde.cpp)
+
+target_link_libraries(
+  bolt_exec_test_lib
+  bolt_vector_test_lib
+  bolt_temp_path
+  bolt_core
+  bolt_exception
+  bolt_expression
+  bolt_parse_parser
+  bolt_duckdb_conversion
+  bolt_dwio_common
+  bolt_dwio_dwrf_reader
+  bolt_dwio_dwrf_writer
+  bolt_dwio_common_test_utils
+  bolt_file_test_utils
+  bolt_type_fbhive
+  bolt_hive_connector
+  bolt_tpch_connector
+  bolt_presto_serializer
+  bolt_functions_prestosql
+  bolt_aggregates)
+
+if(${BOLT_ENABLE_TORCH})
+  target_compile_definitions(bolt_exec_test_lib PRIVATE BOLT_HAS_TORCH=1)
+  target_include_directories(bolt_exec_test_lib SYSTEM PRIVATE ${TORCH_INCLUDE_DIRS})
+  target_link_libraries(bolt_exec bolt_torch)
+endif()
+
+if(${BOLT_BUILD_PYTHON_PACKAGE})
+  target_compile_definitions(bolt_exec_test_lib PRIVATE BOLT_HAS_PYTHON=1)
+  target_include_directories(bolt_exec_test_lib SYSTEM PRIVATE ${pybind11_INCLUDE_DIRS})
+  target_link_libraries(bolt_exec_test_lib bolt_python)
+endif()
+
+if(${BOLT_ENABLE_CUDF})
+  target_compile_definitions(bolt_exec_test_lib PRIVATE BOLT_HAS_CUDF=1)
+  target_include_directories(bolt_exec_test_lib SYSTEM PRIVATE ${cudf_INCLUDE_DIRS})
+  target_link_libraries(bolt_exec_test_lib bolt_cudf_exec bolt_cudf_test_util)
+endif()

@@ -1,0 +1,1148 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* --------------------------------------------------------------------------
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * This file has been modified by ByteDance Ltd. and/or its affiliates on
+ * 2025-11-11.
+ *
+ * Original file was released under the Apache License 2.0,
+ * with the full license text available at:
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This modified file is released under the same license.
+ * --------------------------------------------------------------------------
+ */
+
+#include "bolt/exec/Window.h"
+#include "bolt/exec/OperatorUtils.h"
+#include "bolt/exec/RowsStreamingWindowBuild.h"
+#include "bolt/exec/SortWindowBuild.h"
+#include "bolt/exec/SpillableWindowBuild.h"
+#include "bolt/exec/StreamingWindowBuild.h"
+#include "bolt/exec/Task.h"
+namespace bytedance::bolt::exec {
+
+tsan_atomic<WindowBuildType>& getWindowBuildType() {
+  static tsan_atomic<WindowBuildType> testStreamingWindow =
+      WindowBuildType::kUnspecified;
+  return testStreamingWindow;
+}
+
+TestWindowInjection::TestWindowInjection(WindowBuildType WindowBuildType) {
+  getWindowBuildType() = WindowBuildType;
+}
+
+TestWindowInjection::~TestWindowInjection() {
+  getWindowBuildType() = WindowBuildType::kUnspecified;
+}
+
+Window::Window(
+    int32_t operatorId,
+    DriverCtx* driverCtx,
+    const std::shared_ptr<const core::WindowNode>& windowNode)
+    : Operator(
+          driverCtx,
+          windowNode->outputType(),
+          operatorId,
+          windowNode->id(),
+          "Window",
+          windowNode->inputsSorted()
+              ? (windowNode->canSpill(driverCtx->queryConfig())
+                     ? driverCtx->makeSpillConfig(operatorId)
+                     : std::nullopt)
+              : (windowNode->canSpill(driverCtx->queryConfig())
+                     ? driverCtx->makeSpillConfig(
+                           operatorId,
+                           driverCtx->queryConfig().rowBasedSpillMode())
+                     : std::nullopt)),
+      numInputColumns_(windowNode->inputType()->size()),
+      stringAllocator_(pool()),
+      windowNode_(windowNode),
+      currentPartition_(nullptr) {
+  enableJit_ = driverCtx->queryConfig().enableJitRowCmpRow();
+  const auto numPartitionKeys = windowNode->partitionKeys().size();
+  const auto numSortingKeys = windowNode->sortingKeys().size();
+  for (auto i = 0; i < numSortingKeys; ++i) {
+    sortKeyInfo_.push_back(
+        std::make_pair(numPartitionKeys + i, windowNode->sortingOrders()[i]));
+  }
+
+  auto* spillConfig =
+      spillConfig_.has_value() ? &spillConfig_.value() : nullptr;
+  needSort_ = !(windowNode->inputsSorted());
+  const auto windowBuildType = getWindowBuildType();
+  const bool ignore = ignorePeer();
+  const auto maxBatchRows = driverCtx->queryConfig().maxOutputBatchRows();
+  const auto preferredBatchBytes =
+      driverCtx->queryConfig().preferredOutputBatchBytes();
+  const auto spillThreshold =
+      operatorCtx_->driverCtx()->queryConfig().orderBySpillMemoryThreshold();
+
+  setWindowBuild(
+      windowBuildType,
+      spillConfig,
+      spillThreshold,
+      ignore,
+      maxBatchRows,
+      preferredBatchBytes);
+}
+
+void Window::setRowsStreamingWindowBuild(
+    bool ignorePeer,
+    const common::SpillConfig* spillConfig,
+    int64_t spillThreshold) {
+  LOG(INFO) << (needSort_ ? "sort+" : "")
+            << "RowsStreamingWindowBuild, ignorePeer = " << ignorePeer;
+#define ROWS_STREAMING_WINDOW_BUILD_CTR(INPUT_SORTED)       \
+  std::make_unique<RowsStreamingWindowBuild<INPUT_SORTED>>( \
+      windowNode_,                                          \
+      pool(),                                               \
+      spillConfig,                                          \
+      &nonReclaimableSection_,                              \
+      spillThreshold,                                       \
+      enableJit_)
+
+  if (needSort_) {
+    windowBuild_ = ROWS_STREAMING_WINDOW_BUILD_CTR(true);
+  } else {
+    windowBuild_ = ROWS_STREAMING_WINDOW_BUILD_CTR(false);
+  }
+  windowBuild_->setIgnorePeer(ignorePeer);
+}
+
+void Window::setStreamingWindowBuild(
+    bool ignorePeer,
+    const common::SpillConfig* spillConfig,
+    int64_t spillThreshold) {
+#define SORT_WINDOW_BUILD_CTR()      \
+  std::make_unique<SortWindowBuild>( \
+      windowNode_,                   \
+      pool(),                        \
+      spillConfig,                   \
+      &nonReclaimableSection_,       \
+      spillThreshold,                \
+      enableJit_)
+
+  if (needSort_) {
+    LOG(INFO) << "SortWindowBuild";
+    windowBuild_ = SORT_WINDOW_BUILD_CTR();
+  } else {
+    LOG(INFO) << "StreamingWindowBuild";
+    windowBuild_ = std::make_unique<StreamingWindowBuild>(
+        windowNode_,
+        pool(),
+        spillConfig,
+        &nonReclaimableSection_,
+        spillThreshold,
+        enableJit_);
+  }
+}
+
+void Window::setSpillableWindowBuild(
+    int32_t maxBatchRows,
+    int64_t preferredBatchBytes,
+    const common::SpillConfig* spillConfig,
+    int64_t spillThreshold) {
+  LOG(INFO) << (needSort_ ? "sort+" : "") << "SpillableWindowBuild";
+#define SPILLABLE_WINDOW_BUILD_CTR(INPUT_SORTED)        \
+  std::make_unique<SpillableWindowBuild<INPUT_SORTED>>( \
+      windowNode_,                                      \
+      pool(),                                           \
+      spillConfig,                                      \
+      &nonReclaimableSection_,                          \
+      maxBatchRows,                                     \
+      preferredBatchBytes,                              \
+      spillThreshold,                                   \
+      enableJit_)
+
+  if (needSort_) {
+    windowBuild_ = SPILLABLE_WINDOW_BUILD_CTR(true);
+  } else {
+    windowBuild_ = SPILLABLE_WINDOW_BUILD_CTR(false);
+  }
+  windowBuild_->setIfAggWindowFunc(isAggWindowFunc_);
+}
+
+void Window::setWindowBuild(
+    WindowBuildType windowBuildType,
+    const common::SpillConfig* spillConfig,
+    int64_t spillThreshold,
+    bool ignorePeer,
+    int32_t maxBatchRows,
+    int64_t preferredBatchBytes) {
+  switch (windowBuildType) {
+    case WindowBuildType::kUnspecified:
+      if (windowNode_->followedTopNum() > 0 && needSort_) {
+        LOG(INFO) << "sort+SortWindowBuild for follwedTopNum > 0 ";
+        windowBuild_ = SORT_WINDOW_BUILD_CTR();
+        return;
+      }
+
+      if (supportRowsStreaming()) {
+        setRowsStreamingWindowBuild(ignorePeer, spillConfig, spillThreshold);
+        return;
+      }
+
+      if (isSpillableWindowBuild()) {
+        setSpillableWindowBuild(
+            maxBatchRows, preferredBatchBytes, spillConfig, spillThreshold);
+        return;
+      }
+
+      setStreamingWindowBuild(ignorePeer, spillConfig, spillThreshold);
+      return;
+    case WindowBuildType::kSortWindowBuild:
+      setStreamingWindowBuild(ignorePeer, spillConfig, spillThreshold);
+      return;
+    case WindowBuildType::kRowStreamingWindowBuild:
+      BOLT_CHECK_GT(supportRowsStreaming(), 0);
+      BOLT_CHECK_LE(windowNode_->followedTopNum(), 0);
+      setRowsStreamingWindowBuild(ignorePeer, spillConfig, spillThreshold);
+      return;
+    case WindowBuildType::kSpillableWindowBuild:
+      BOLT_CHECK_GT(isSpillableWindowBuild(), 0);
+      setSpillableWindowBuild(
+          maxBatchRows, preferredBatchBytes, spillConfig, spillThreshold);
+      return;
+  }
+} // namespace bytedance::bolt::exec
+
+void Window::initialize() {
+  Operator::initialize();
+  BOLT_CHECK_NOT_NULL(windowNode_);
+  createWindowFunctions();
+  if (isSpillableWindowBuild_) {
+    createWindowFunctionsForSpillableWindowBuild();
+    for (const auto& func : windowFunctions_) {
+      windowResultTypes_.push_back(func->resultType());
+    }
+  }
+  createPeerAndFrameBuffers();
+  windowBuild_->setNumRowsPerOutput(numRowsPerOutput_);
+  windowNode_.reset();
+}
+
+namespace {
+void checkRowFrameBounds(const core::WindowNode::Frame& frame) {
+  auto frameBoundCheck = [&](const core::TypedExprPtr& frameValue) -> void {
+    if (frameValue == nullptr) {
+      return;
+    }
+
+    BOLT_USER_CHECK(
+        frameValue->type() == INTEGER() || frameValue->type() == BIGINT(),
+        "k frame bound must be INTEGER or BIGINT type");
+  };
+  frameBoundCheck(frame.startValue);
+  frameBoundCheck(frame.endValue);
+}
+
+void checkKRangeFrameBounds(
+    const std::shared_ptr<const core::WindowNode>& windowNode,
+    const core::WindowNode::Frame& frame,
+    const RowTypePtr& inputType) {
+  // For k Range frame bound:
+  // i) The order by needs to be a single column for bound comparisons
+  // (Checked in WindowNode constructor).
+  // ii) The bounds values are pre-computed in the start(end)Value bound
+  // fields. So, start(end)Value bounds cannot be constants.
+  // iii) The frame bound column and the ORDER BY column must have
+  // the same type for correct comparisons.
+  auto orderByType = windowNode->sortingKeys()[0]->type();
+  auto frameBoundCheck = [&](const core::TypedExprPtr& frameValue) -> void {
+    if (frameValue == nullptr) {
+      return;
+    }
+
+    auto frameChannel = exprToChannel(frameValue.get(), inputType);
+    BOLT_USER_CHECK_NE(
+        frameChannel,
+        kConstantChannel,
+        "Window frame of type RANGE does not support constant arguments");
+
+    auto frameType = inputType->childAt(frameChannel);
+    BOLT_USER_CHECK(
+        *frameType == *orderByType,
+        "Window frame of type RANGE does not match types of the ORDER BY"
+        " and frame column");
+  };
+
+  frameBoundCheck(frame.startValue);
+  frameBoundCheck(frame.endValue);
+}
+
+}; // namespace
+
+Window::WindowFrame Window::createWindowFrame(
+    const std::shared_ptr<const core::WindowNode>& windowNode,
+    const core::WindowNode::Frame& frame,
+    const RowTypePtr& inputType) {
+  if (frame.type == core::WindowNode::WindowType::kRows) {
+    checkRowFrameBounds(frame);
+  }
+
+  if (frame.type == core::WindowNode::WindowType::kRange &&
+      (frame.startValue || frame.endValue)) {
+    checkKRangeFrameBounds(windowNode, frame, inputType);
+  }
+
+  auto createFrameChannelArg =
+      [&](const core::TypedExprPtr& frame) -> std::optional<FrameChannelArg> {
+    // frame is nullptr for non (kPreceding or kFollowing) frames.
+    if (frame == nullptr) {
+      return std::nullopt;
+    }
+    auto frameChannel = exprToChannel(frame.get(), inputType);
+    if (frameChannel == kConstantChannel) {
+      auto constant = core::TypedExprs::asConstant(frame)->value();
+      BOLT_CHECK(!constant.isNull(), "Window frame offset must not be null");
+      auto value = VariantConverter::convert(constant, TypeKind::BIGINT)
+                       .value<int64_t>();
+      BOLT_USER_CHECK_GE(
+          value, 0, "Window frame {} offset must not be negative", value);
+      return std::make_optional(
+          FrameChannelArg{kConstantChannel, nullptr, value});
+    } else {
+      return std::make_optional(FrameChannelArg{
+          frameChannel,
+          BaseVector::create(frame->type(), 0, pool()),
+          std::nullopt});
+    }
+  };
+
+  return WindowFrame(
+      {frame.type,
+       frame.startType,
+       frame.endType,
+       createFrameChannelArg(frame.startValue),
+       createFrameChannelArg(frame.endValue)});
+}
+
+void Window::createWindowFunctions() {
+  BOLT_CHECK_NOT_NULL(windowNode_);
+  BOLT_CHECK(windowFunctions_.empty());
+  BOLT_CHECK(windowFrames_.empty());
+
+  const auto& inputType = windowNode_->sources()[0]->outputType();
+  for (const auto& windowNodeFunction : windowNode_->windowFunctions()) {
+    std::vector<WindowFunctionArg> functionArgs;
+    functionArgs.reserve(windowNodeFunction.functionCall->inputs().size());
+    for (auto& arg : windowNodeFunction.functionCall->inputs()) {
+      auto channel = exprToChannel(arg.get(), inputType);
+      if (channel == kConstantChannel) {
+        auto constantArg = core::TypedExprs::asConstant(arg);
+        functionArgs.push_back(
+            {arg->type(), constantArg->toConstantVector(pool()), std::nullopt});
+      } else {
+        functionArgs.push_back({arg->type(), nullptr, channel});
+      }
+    }
+
+    windowFunctions_.push_back(WindowFunction::create(
+        windowNodeFunction.functionCall->name(),
+        functionArgs,
+        windowNodeFunction.functionCall->type(),
+        windowNodeFunction.ignoreNulls,
+        operatorCtx_->pool(),
+        &stringAllocator_,
+        operatorCtx_->driverCtx()->queryConfig()));
+
+    windowFrames_.push_back(
+        createWindowFrame(windowNode_, windowNodeFunction.frame, inputType));
+  }
+}
+
+void Window::createWindowFunctionsForSpillableWindowBuild() {
+  const auto& inputType = windowNode_->sources()[0]->outputType();
+  std::vector<std::unique_ptr<exec::WindowFunction>> windowFunctions;
+  for (const auto& windowNodeFunction : windowNode_->windowFunctions()) {
+    std::vector<WindowFunctionArg> functionArgs;
+    functionArgs.reserve(windowNodeFunction.functionCall->inputs().size());
+    for (auto& arg : windowNodeFunction.functionCall->inputs()) {
+      auto channel = exprToChannel(arg.get(), inputType);
+      if (channel == kConstantChannel) {
+        auto constantArg = core::TypedExprs::asConstant(arg);
+        functionArgs.push_back(
+            {arg->type(),
+             constantArg->toConstantVector(memory::spillMemoryPool()),
+             std::nullopt});
+      } else {
+        functionArgs.push_back({arg->type(), nullptr, channel});
+      }
+    }
+
+    windowFunctions.push_back(WindowFunction::create(
+        windowNodeFunction.functionCall->name(),
+        functionArgs,
+        windowNodeFunction.functionCall->type(),
+        windowNodeFunction.ignoreNulls,
+        memory::spillMemoryPool(),
+        &stringAllocator_,
+        operatorCtx_->driverCtx()->queryConfig()));
+  }
+  if (needSort_) {
+    dynamic_cast<SpillableWindowBuild<true>*>(windowBuild_.get())
+        ->setWindowFunction(std::move(windowFunctions));
+  } else {
+    dynamic_cast<SpillableWindowBuild<false>*>(windowBuild_.get())
+        ->setWindowFunction(std::move(windowFunctions));
+  }
+}
+
+// Support 'rank' and
+// 'row_number' functions and the agg window function with default frame.
+bool Window::supportRowsStreaming() {
+  for (const auto& windowNodeFunction : windowNode_->windowFunctions()) {
+    const auto& functionName = windowNodeFunction.functionCall->name();
+    auto windowFunctionMetadata =
+        exec::getWindowFunctionMetadata(functionName).value();
+    if (windowFunctionMetadata.processingUnit == ProcessingUnit::kPartition) {
+      return false;
+    }
+
+    const auto& frame = windowNodeFunction.frame;
+    bool isDefaultFrame =
+        (frame.startType == core::WindowNode::BoundType::kUnboundedPreceding &&
+         frame.endType == core::WindowNode::BoundType::kCurrentRow);
+    // Only support the agg window function with default frame.
+    if (!windowFunctionMetadata.ignoreFrame && !isDefaultFrame) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool Window::ignorePeer() {
+  for (const auto& windowNodeFunction : windowNode_->windowFunctions()) {
+    const auto& functionName = windowNodeFunction.functionCall->name();
+    auto windowFunctionMetadata =
+        exec::getWindowFunctionMetadata(functionName).value();
+    if (windowFunctionMetadata.ignorePeerByFrame) {
+      // sum(), count() could ignore peer in `kRows`
+      if (windowNodeFunction.frame.type !=
+          core::WindowNode::WindowType::kRows) {
+        return false;
+      }
+    } else if (!windowFunctionMetadata.ignorePeer) {
+      // rank() or dense_rank() could not ignore peer, return false
+      return false;
+    }
+  }
+  return true;
+}
+
+void Window::addInput(RowVectorPtr input) {
+  MicrosecondTimer timer(&addInputTimeUs_);
+  if (needSort_) {
+    windowBuild_->addInputCommon(input);
+  }
+  windowBuild_->addInput(input);
+  numRows_ += input->size();
+}
+
+void Window::reclaim(
+    uint64_t targetBytes,
+    memory::MemoryReclaimer::Stats& stats) {
+  BOLT_CHECK(canReclaim());
+  BOLT_CHECK(!nonReclaimableSection_);
+
+  if (!needSort_ && noMoreInput_) {
+    ++stats.numNonReclaimableAttempts;
+    // TODO Add support for spilling after noMoreInput().
+    LOG(WARNING)
+        << name()
+        << " Can't reclaim from window operator which has started producing output: "
+        << pool()->name()
+        << ", usage: " << succinctBytes(pool()->currentBytes())
+        << ", reservation: " << succinctBytes(pool()->reservedBytes());
+    return;
+  }
+  if (needSort_ && !noMoreInput_) {
+    LOG(INFO) << __FUNCTION__ << " enter sortSpill. Before spill:  usedBytes = "
+              << pool()->currentBytes()
+              << ", reservedBytes = " << pool()->reservedBytes();
+    windowBuild_->sortSpill();
+  } else {
+    LOG(INFO) << "nomore input windowBuild->spill()";
+    windowBuild_->spill();
+  }
+
+  pool()->release();
+  LOG(INFO) << __FUNCTION__
+            << " after release usedBytes = " << pool()->currentBytes()
+            << ", reservedBytes = " << pool()->reservedBytes();
+}
+
+void Window::createPeerAndFrameBuffers() {
+  // TODO: This computation needs to be revised. It only takes into account
+  // the input columns size. We need to also account for the output columns.
+  numRowsPerOutput_ = outputBatchRows(windowBuild_->estimateRowSize());
+  maxNumRowsPerOutput_ = numRowsPerOutput_;
+  peerStartBuffer_ = AlignedBuffer::allocate<vector_size_t>(
+      numRowsPerOutput_, operatorCtx_->pool());
+  peerEndBuffer_ = AlignedBuffer::allocate<vector_size_t>(
+      numRowsPerOutput_, operatorCtx_->pool());
+
+  auto numFuncs = windowFunctions_.size();
+  frameStartBuffers_.reserve(numFuncs);
+  frameEndBuffers_.reserve(numFuncs);
+  validFrames_.reserve(numFuncs);
+
+  for (auto i = 0; i < numFuncs; i++) {
+    BufferPtr frameStartBuffer = AlignedBuffer::allocate<vector_size_t>(
+        numRowsPerOutput_, operatorCtx_->pool());
+    BufferPtr frameEndBuffer = AlignedBuffer::allocate<vector_size_t>(
+        numRowsPerOutput_, operatorCtx_->pool());
+    frameStartBuffers_.push_back(frameStartBuffer);
+    frameEndBuffers_.push_back(frameEndBuffer);
+    validFrames_.push_back(SelectivityVector(numRowsPerOutput_));
+  }
+}
+
+void Window::noMoreInput() {
+  MicrosecondTimer timer(&addInputTimeUs_);
+  Operator::noMoreInput();
+  auto maxOutputRows = outputBatchRows(windowBuild_->estimateOutputRowSize());
+  windowBuild_->setMaxOutputRows(maxOutputRows);
+  if (needSort_) {
+    windowBuild_->noMoreInputCommon();
+  }
+  windowBuild_->noMoreInput();
+}
+
+void Window::callResetPartition() {
+  MicrosecondTimer timer(&extractColumnTimeUs_);
+  partitionOffset_ = 0;
+  peerStartRow_ = 0;
+  peerEndRow_ = 0;
+  currentPartition_ = nullptr;
+  bool hasNextPartition = false;
+  hasNextPartition = windowBuild_->hasNextPartition();
+
+  if (hasNextPartition) {
+    currentPartition_ = windowBuild_->nextPartition();
+    for (int i = 0; i < windowFunctions_.size(); i++) {
+      windowFunctions_[i]->resetPartition(currentPartition_.get());
+    }
+  }
+}
+
+namespace {
+
+template <typename T>
+void updateKRowsOffsetsColumn(
+    bool isKPreceding,
+    const VectorPtr& value,
+    vector_size_t startRow,
+    vector_size_t numRows,
+    vector_size_t* rawFrameBounds) {
+  auto offsets = value->values()->as<T>();
+  for (auto i = 0; i < numRows; i++) {
+    BOLT_USER_CHECK(
+        !value->isNullAt(i), "Window frame offset must not be null");
+    BOLT_USER_CHECK_GE(
+        offsets[i],
+        0,
+        "Window frame {} offset must not be negative",
+        offsets[i]);
+  }
+
+  // Preceding involves subtracting from the current position, while following
+  // moves ahead.
+  int precedingFactor = isKPreceding ? -1 : 1;
+  for (auto i = 0; i < numRows; i++) {
+    auto startValue = (int64_t)(startRow + i) + precedingFactor * offsets[i];
+    if (startValue < INT32_MIN) {
+      rawFrameBounds[i] = 0;
+    } else if (startValue > INT32_MAX) {
+      // computeValidFrames will replace INT32_MAX set here
+      // with partition's final row index.
+      rawFrameBounds[i] = INT32_MAX;
+    } else {
+      rawFrameBounds[i] = startValue;
+    }
+  }
+}
+
+}; // namespace
+
+void Window::updateKRowsFrameBounds(
+    bool isKPreceding,
+    const FrameChannelArg& frameArg,
+    vector_size_t startRow,
+    vector_size_t numRows,
+    vector_size_t* rawFrameBounds) {
+  if (frameArg.index == kConstantChannel) {
+    auto constantOffset = frameArg.constant.value();
+    auto startValue =
+        (int64_t)startRow + (isKPreceding ? -constantOffset : constantOffset);
+
+    if (isKPreceding) {
+      if (startValue < INT32_MIN) {
+        // For overflow in kPreceding frames, k < INT32_MIN. Since the max
+        // number of rows in a partition is INT32_MAX, the frameBound will
+        // always be bound to the first row of the partition
+        std::fill_n(rawFrameBounds, numRows, 0);
+        return;
+      }
+      std::iota(rawFrameBounds, rawFrameBounds + numRows, startValue);
+      return;
+    }
+
+    // KFollowing.
+    // The start index that overflow happens.
+    int32_t overflowStart;
+    if (startValue > (int64_t)INT32_MAX) {
+      overflowStart = 0;
+    } else {
+      overflowStart = INT32_MAX - startValue + 1;
+    }
+    if (overflowStart >= 0 && overflowStart < numRows) {
+      std::iota(rawFrameBounds, rawFrameBounds + overflowStart, startValue);
+      // For remaining rows that overflow happens, use INT32_MAX.
+      // computeValidFrames will replace it with partition's final row index.
+      std::fill_n(
+          rawFrameBounds + overflowStart, numRows - overflowStart, INT32_MAX);
+      return;
+    }
+    std::iota(rawFrameBounds, rawFrameBounds + numRows, startValue);
+  } else {
+    currentPartition_->extractColumn(
+        frameArg.index, partitionOffset_, numRows, 0, frameArg.value);
+    if (frameArg.value->typeKind() == TypeKind::INTEGER) {
+      updateKRowsOffsetsColumn<int32_t>(
+          isKPreceding, frameArg.value, startRow, numRows, rawFrameBounds);
+    } else {
+      updateKRowsOffsetsColumn<int64_t>(
+          isKPreceding, frameArg.value, startRow, numRows, rawFrameBounds);
+    }
+  }
+}
+
+void Window::updateFrameBounds(
+    const WindowFrame& windowFrame,
+    const bool isStartBound,
+    const vector_size_t startRow,
+    const vector_size_t numRows,
+    const vector_size_t* rawPeerStarts,
+    const vector_size_t* rawPeerEnds,
+    vector_size_t* rawFrameBounds) {
+  auto windowType = windowFrame.type;
+  auto boundType = isStartBound ? windowFrame.startType : windowFrame.endType;
+  auto frameArg = isStartBound ? windowFrame.start : windowFrame.end;
+
+  const vector_size_t* rawPeerBuffer =
+      isStartBound ? rawPeerStarts : rawPeerEnds;
+  switch (boundType) {
+    case core::WindowNode::BoundType::kUnboundedPreceding:
+      std::fill_n(rawFrameBounds, numRows, 0);
+      break;
+    case core::WindowNode::BoundType::kUnboundedFollowing:
+      std::fill_n(rawFrameBounds, numRows, currentPartition_->numRows() - 1);
+      break;
+    case core::WindowNode::BoundType::kCurrentRow: {
+      if (windowType == core::WindowNode::WindowType::kRange) {
+        std::copy(rawPeerBuffer, rawPeerBuffer + numRows, rawFrameBounds);
+      } else {
+        // Fills the frameBound buffer with increasing value of row indices
+        // (corresponding to CURRENT ROW) from the startRow of the current
+        // output buffer.
+        std::iota(rawFrameBounds, rawFrameBounds + numRows, startRow);
+      }
+      break;
+    }
+    case core::WindowNode::BoundType::kPreceding: {
+      if (windowType == core::WindowNode::WindowType::kRows) {
+        updateKRowsFrameBounds(
+            true, frameArg.value(), startRow, numRows, rawFrameBounds);
+      } else {
+        currentPartition_->computeKRangeFrameBounds(
+            isStartBound,
+            true,
+            frameArg.value().index,
+            startRow,
+            numRows,
+            rawPeerBuffer,
+            rawFrameBounds);
+      }
+      break;
+    }
+    case core::WindowNode::BoundType::kFollowing: {
+      if (windowType == core::WindowNode::WindowType::kRows) {
+        updateKRowsFrameBounds(
+            false, frameArg.value(), startRow, numRows, rawFrameBounds);
+      } else {
+        currentPartition_->computeKRangeFrameBounds(
+            isStartBound,
+            false,
+            frameArg.value().index,
+            startRow,
+            numRows,
+            rawPeerBuffer,
+            rawFrameBounds);
+      }
+      break;
+    }
+    default:
+      BOLT_USER_FAIL("Invalid frame bound type");
+  }
+}
+
+namespace {
+// Frame end points are always expected to go from frameStart to frameEnd
+// rows in increasing row numbers in the partition. k rows/range frames could
+// potentially violate this.
+// This function identifies the rows that violate the framing requirements
+// and sets bits in the validFrames SelectivityVector for usage in the
+// WindowFunction subsequently.
+void computeValidFrames(
+    vector_size_t lastRow,
+    vector_size_t numRows,
+    vector_size_t* rawFrameStarts,
+    vector_size_t* rawFrameEnds,
+    SelectivityVector& validFrames) {
+  auto frameStart = 0;
+  auto frameEnd = 0;
+
+  for (auto i = 0; i < numRows; i++) {
+    frameStart = rawFrameStarts[i];
+    frameEnd = rawFrameEnds[i];
+    // All valid frames require frameStart <= frameEnd to define the frame
+    // rows. Also, frameEnd >= 0, so that the frameEnd doesn't fall before the
+    // partition. And frameStart <= lastRow so that the frameStart doesn't
+    // fall after the partition rows.
+    if (frameStart <= frameEnd && frameEnd >= 0 && frameStart <= lastRow) {
+      rawFrameStarts[i] = std::max(frameStart, 0);
+      rawFrameEnds[i] = std::min(frameEnd, lastRow);
+    } else {
+      validFrames.setValid(i, false);
+    }
+  }
+  validFrames.updateBounds();
+}
+
+}; // namespace
+
+void Window::computePeerAndFrameBuffers(
+    vector_size_t startRow,
+    vector_size_t endRow) {
+  vector_size_t numRows = endRow - startRow;
+  vector_size_t numFuncs = windowFunctions_.size();
+
+  // Size buffers for the call to WindowFunction::apply.
+  auto bufferSize = numRows * sizeof(vector_size_t);
+  peerStartBuffer_->setSize(bufferSize);
+  peerEndBuffer_->setSize(bufferSize);
+  auto rawPeerStarts = peerStartBuffer_->asMutable<vector_size_t>();
+  auto rawPeerEnds = peerEndBuffer_->asMutable<vector_size_t>();
+
+  std::vector<vector_size_t*> rawFrameStarts;
+  std::vector<vector_size_t*> rawFrameEnds;
+  rawFrameStarts.reserve(numFuncs);
+  rawFrameEnds.reserve(numFuncs);
+  for (auto w = 0; w < numFuncs; w++) {
+    frameStartBuffers_[w]->setSize(bufferSize);
+    frameEndBuffers_[w]->setSize(bufferSize);
+
+    auto rawFrameStart = frameStartBuffers_[w]->asMutable<vector_size_t>();
+    auto rawFrameEnd = frameEndBuffers_[w]->asMutable<vector_size_t>();
+    rawFrameStarts.push_back(rawFrameStart);
+    rawFrameEnds.push_back(rawFrameEnd);
+  }
+
+  std::tie(peerStartRow_, peerEndRow_) = currentPartition_->computePeerBuffers(
+      startRow,
+      endRow,
+      peerStartRow_,
+      peerEndRow_,
+      rawPeerStarts,
+      rawPeerEnds,
+      enableJit);
+  for (auto i = 0; i < numFuncs; i++) {
+    const auto& windowFrame = windowFrames_[i];
+    // Default all rows to have validFrames. The invalidity of frames is only
+    // computed for k rows/range frames at a later point.
+    validFrames_[i].resizeFill(numRows, true);
+    updateFrameBounds(
+        windowFrame,
+        true,
+        startRow,
+        numRows,
+        rawPeerStarts,
+        rawPeerEnds,
+        rawFrameStarts[i]);
+    updateFrameBounds(
+        windowFrame,
+        false,
+        startRow,
+        numRows,
+        rawPeerStarts,
+        rawPeerEnds,
+        rawFrameEnds[i]);
+    if (windowFrames_[i].start || windowFrames_[i].end) {
+      // k preceding and k following bounds can be problematic. They can
+      // go over the partition limits or result in empty frames. Fix the
+      // frame boundaries and compute the validFrames SelectivityVector
+      // for these cases. Not all functions care about validFrames viz.
+      // Ranking functions do not care about frames. So the function decides
+      // further what to do with empty frames.
+      computeValidFrames(
+          currentPartition_->numRows() - 1,
+          numRows,
+          rawFrameStarts[i],
+          rawFrameEnds[i],
+          validFrames_[i]);
+    }
+  }
+}
+
+void Window::getInputColumns(
+    vector_size_t startRow,
+    vector_size_t endRow,
+    vector_size_t resultOffset,
+    const RowVectorPtr& result) {
+  auto numRows = endRow - startRow;
+  for (int i = 0; i < numInputColumns_; ++i) {
+    currentPartition_->extractColumn(
+        i, partitionOffset_, numRows, resultOffset, result->childAt(i));
+  }
+}
+
+void Window::callApplyForPartitionRows(
+    vector_size_t startRow,
+    vector_size_t endRow,
+    vector_size_t resultOffset,
+    const RowVectorPtr& result) {
+  getInputColumns(startRow, endRow, resultOffset, result);
+  computePeerAndFrameBuffers(startRow, endRow);
+  vector_size_t numFuncs = windowFunctions_.size();
+  for (auto w = 0; w < numFuncs; w++) {
+    windowFunctions_[w]->apply(
+        peerStartBuffer_,
+        peerEndBuffer_,
+        frameStartBuffers_[w],
+        frameEndBuffers_[w],
+        validFrames_[w],
+        resultOffset,
+        result->childAt(numInputColumns_ + w));
+  }
+
+  vector_size_t numRows = endRow - startRow;
+  numProcessedRows_ += numRows;
+  partitionOffset_ += numRows;
+}
+
+vector_size_t Window::callApplyLoop(
+    vector_size_t numOutputRows,
+    const RowVectorPtr& result) {
+  // Compute outputs by traversing as many partitions as possible. This
+  // logic takes care of partial partitions output also.
+  vector_size_t resultIndex = 0;
+  vector_size_t numOutputRowsLeft = numOutputRows;
+
+  // This function requires that the currentPartition_ is available for
+  // output.
+  BOLT_DCHECK_NOT_NULL(currentPartition_);
+  while (numOutputRowsLeft > 0) {
+    // SpillableWindowBuild can not be handled by callApplyLoop.
+    if (isSpillableWindowBuild_ && currentPartition_->isSpilled()) {
+      break;
+    }
+    auto rowsForCurrentPartition =
+        currentPartition_->numRows() - partitionOffset_;
+    if (rowsForCurrentPartition <= numOutputRowsLeft) {
+      // Current partition can fit completely in the output buffer.
+      // So output all its rows.
+      callApplyForPartitionRows(
+          partitionOffset_,
+          partitionOffset_ + rowsForCurrentPartition,
+          resultIndex,
+          result);
+      resultIndex += rowsForCurrentPartition;
+      numOutputRowsLeft -= rowsForCurrentPartition;
+      if (currentPartition_->supportRowsStreaming()) {
+        if (currentPartition_->processFinished()) {
+          callResetPartition();
+          if (currentPartition_ &&
+              partitionOffset_ == currentPartition_->numRows()) {
+            if (!currentPartition_->buildNextRows()) {
+              windowBuild_->loadNextPartialPartitionFromSpill();
+              break;
+            }
+          }
+
+        } else {
+          // Break until the next getOutput call to handle the remaining data
+          // in currentPartition_.
+          break;
+        }
+      } else {
+        callResetPartition();
+      }
+
+      if (!currentPartition_) {
+        // The WindowBuild doesn't have any more partitions to process right
+        // now. So break until the next getOutput call.
+        break;
+      }
+    } else {
+      // Current partition can fit only partially in the output buffer.
+      // Call apply for the rows that can fit in the buffer and break from
+      // outputting.
+      callApplyForPartitionRows(
+          partitionOffset_,
+          partitionOffset_ + numOutputRowsLeft,
+          resultIndex,
+          result);
+      numOutputRowsLeft = 0;
+      break;
+    }
+  }
+  // Return the number of processed rows.
+  return numOutputRows - numOutputRowsLeft;
+}
+
+RowVectorPtr Window::getOutput() {
+  MicrosecondTimer timer(&computeWindowFunctionTimeUs_);
+  if (needSort_ && !noMoreInput_) {
+    return nullptr;
+  }
+  if (isFinished()) {
+    recordWindowStats();
+    if (numRows_ == 0 || numRows_ - numProcessedRows_ == 0) {
+      windowBuild_->finish();
+    }
+  }
+
+  if (numRows_ == 0) {
+    return nullptr;
+  }
+
+  auto numRowsLeft = numRows_ - numProcessedRows_;
+  if (numRowsLeft == 0) {
+    return nullptr;
+  }
+
+  if (!currentPartition_) {
+    callResetPartition();
+    if (!currentPartition_) {
+      // WindowBuild doesn't have a partition to output.
+      if (isFinished()) {
+        windowBuild_->finish();
+      }
+      return nullptr;
+    }
+  }
+
+  if (isSpillableWindowBuild_ && currentPartition_->isSpilled()) {
+    return getOutputFromSpilledPartition();
+  }
+
+  if (currentPartition_->supportRowsStreaming() &&
+      partitionOffset_ == currentPartition_->numRows()) {
+    if (!currentPartition_->buildNextRows()) {
+      windowBuild_->loadNextPartialPartitionFromSpill();
+      return nullptr;
+    }
+  }
+
+  auto numOutputRows = std::min(numRowsPerOutput_, numRowsLeft);
+  auto usedBytes = operatorCtx_->pool()->currentBytes();
+  auto result = BaseVector::create<RowVector>(
+      outputType_, numOutputRows, operatorCtx_->pool());
+
+  // Compute the output values of window functions.
+  auto numResultRows = callApplyLoop(numOutputRows, result);
+  if (numRows_ == 0 || numRows_ - numProcessedRows_ == 0) {
+    windowBuild_->finish();
+  }
+
+  auto resultBytes = operatorCtx_->pool()->currentBytes() - usedBytes;
+  std::optional<uint64_t> resultRowSize = resultBytes / numResultRows;
+
+  auto rowsPerOutput = outputBatchRows(resultRowSize);
+  if (rowsPerOutput < maxNumRowsPerOutput_) {
+    numRowsPerOutput_ = rowsPerOutput;
+    windowBuild_->setNumRowsPerOutput(numRowsPerOutput_);
+  }
+
+  return numResultRows < numOutputRows
+      ? std::dynamic_pointer_cast<RowVector>(result->slice(0, numResultRows))
+      : result;
+}
+
+RowVectorPtr Window::getOutputFromSpilledPartition() {
+  RowVectorPtr spilledOutput;
+  bool isEnd;
+  if (LIKELY(currentPartition_->getBatch(spilledOutput, isEnd))) {
+    auto numOutputRows = spilledOutput->size();
+    BOLT_DCHECK(numOutputRows > 0);
+    std::vector<VectorPtr> children;
+    // input columns
+    children.insert(
+        children.end(),
+        spilledOutput->children().begin(),
+        spilledOutput->children().end());
+    // window function columns
+    for (auto w = 0; w < windowResultTypes_.size(); ++w) {
+      auto child = BaseVector::create(
+          windowResultTypes_[w], numOutputRows, operatorCtx_->pool());
+      currentPartition_->getWindowFunctionResults(
+          child, numOutputRows, w, windowBuild_->isAggWindowFunc());
+      children.emplace_back(std::move(child));
+    }
+    numProcessedRows_ += numOutputRows;
+    if (isEnd) {
+      windowBuild_->resetSpiller();
+      callResetPartition();
+    }
+    return std::make_shared<RowVector>(
+        operatorCtx_->pool(),
+        outputType_,
+        BufferPtr(nullptr),
+        numOutputRows,
+        std::move(children));
+  } else {
+    // no more batch from spilled file
+    // for SpillableWindowBuild, need to set spiller_ to nullptr
+    // or needsInput will not consume more data
+    windowBuild_->resetSpiller();
+    callResetPartition();
+    return nullptr;
+  }
+}
+
+bool Window::isSpillableWindowBuild() {
+  static std::map<std::string, bool> supportedAggFunc{
+      {"sum", true},
+      {"count", true},
+      {"min", true},
+      {"max", true},
+      {"avg", true}};
+  static std::map<std::string, bool> supportedNonAggFunc{
+      {"lag", true}, {"lead", true}};
+
+  std::string sanitizedName;
+  auto sanitizeFunctionName = [&](const std::string& name) {
+    sanitizedName.resize(name.size());
+    std::transform(
+        name.begin(), name.end(), sanitizedName.begin(), [](unsigned char c) {
+          return std::tolower(c);
+        });
+  };
+
+  isSpillableWindowBuild_ = true;
+  bool hasAggFunction = false;
+  bool hasNonAggFunc = false;
+  for (const auto& windowNodeFunction : windowNode_->windowFunctions()) {
+    sanitizeFunctionName(windowNodeFunction.functionCall->name());
+    if (supportedAggFunc.find(sanitizedName) != supportedAggFunc.end()) {
+      if (windowNodeFunction.frame.startType !=
+              core::WindowNode::BoundType::kUnboundedPreceding ||
+          windowNodeFunction.frame.endType !=
+              core::WindowNode::BoundType::kUnboundedFollowing) {
+        isSpillableWindowBuild_ = false;
+        isAggWindowFunc_ = false;
+        break;
+      }
+      hasAggFunction = true;
+      isAggWindowFunc_ = true;
+    } else if (
+        supportedNonAggFunc.find(sanitizedName) != supportedNonAggFunc.end()) {
+      // lead/lag, but offset not 1
+      if (!supportedNonAggWindowFuncOffsetBySpill(windowNodeFunction)) {
+        // for offset >= 2 in lead/lag, spillableWindow does not support
+        // supportedNonAggWindowFuncOffsetBySpill() returns
+        // - false if offset >=2
+        // - true if offset is empty or = 1
+        isSpillableWindowBuild_ = false;
+        break;
+      }
+      hasNonAggFunc = true;
+    } else {
+      // contains other function
+      isSpillableWindowBuild_ = false;
+      isAggWindowFunc_ = false;
+      break;
+    }
+  }
+  // has both agg and non agg, do not spill because partialPartition is not
+  // compatible
+  if (isSpillableWindowBuild_ && hasNonAggFunc && hasAggFunction) {
+    isSpillableWindowBuild_ = false;
+    isAggWindowFunc_ = false;
+  }
+  return isSpillableWindowBuild_;
+}
+
+bool Window::supportedNonAggWindowFuncOffsetBySpill(
+    const core::WindowNode::Function& windowNodeFunction) {
+  auto numArgs = windowNodeFunction.functionCall->inputs().size();
+  if (UNLIKELY(numArgs == 0)) {
+    return false;
+  }
+  if (numArgs == 1) {
+    return true;
+  }
+  const auto& inputType = windowNode_->sources()[0]->outputType();
+  auto& arg = windowNodeFunction.functionCall->inputs()[1];
+  auto channel = exprToChannel(arg.get(), inputType);
+  if (channel == kConstantChannel) {
+    const auto& constantArg = core::TypedExprs::asConstant(arg);
+    const auto& constantVector = constantArg->toConstantVector(pool());
+    if (constantVector->isNullAt(0)) {
+      return true;
+    }
+    if (arg->type()->kind() == TypeKind::INTEGER) {
+      if (constantVector->as<ConstantVector<int32_t>>()->valueAt(0) >= 2) {
+        return false;
+      }
+    }
+    if (arg->type()->kind() == TypeKind::BIGINT) {
+      if (constantVector->as<ConstantVector<int64_t>>()->valueAt(0) >= 2) {
+        return false;
+      }
+    }
+  } else {
+    // offset if not constant
+    return false;
+  }
+  return true;
+}
+
+void Window::recordWindowStats() {
+  auto spillStats = windowBuild_->spilledStats();
+  if (!hasRecordSpillStats_ && spillStats) {
+    recordSpillStats(spillStats.value());
+    hasRecordSpillStats_ = true;
+  }
+  auto windowStatsOr = windowStats();
+  addInputTimeUs_ = 0;
+  computeWindowFunctionTimeUs_ = 0;
+  extractColumnTimeUs_ = 0;
+  getOutputTimeUs_ = 0;
+  loadFromSpillTimeUs_ = 0;
+  hasNextPartitionUs_ = 0;
+  windowSpillTimeUs_ = 0;
+  buildPartitionTimeUs_ = 0;
+  if (windowStatsOr.has_value()) {
+    Operator::recordWindowStats(windowStatsOr.value());
+  }
+}
+} // namespace bytedance::bolt::exec

@@ -1,0 +1,365 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* --------------------------------------------------------------------------
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * This file has been modified by ByteDance Ltd. and/or its affiliates on
+ * 2025-11-11.
+ *
+ * Original file was released under the Apache License 2.0,
+ * with the full license text available at:
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This modified file is released under the same license.
+ * --------------------------------------------------------------------------
+ */
+
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+#include "bolt/common/base/BoltException.h"
+#include "bolt/dwio/common/TypeUtils.h"
+#include "bolt/dwio/common/TypeWithId.h"
+#include "bolt/type/fbhive/HiveTypeParser.h"
+#include "bolt/type/fbhive/HiveTypeSerializer.h"
+using namespace bytedance::bolt;
+using namespace bytedance::bolt::dwio;
+using namespace bytedance::bolt::dwio::common;
+using namespace bytedance::bolt::dwio::common::typeutils;
+using bytedance::bolt::type::fbhive::HiveTypeParser;
+using bytedance::bolt::type::fbhive::HiveTypeSerializer;
+
+TEST(TestType, selectedType) {
+  auto type = HiveTypeParser().parse(
+      "struct<col0:tinyint,col1:smallint,col2:array<string>,"
+      "col3:map<float,double>,col4:float,"
+      "col5:int,col6:bigint,col7:string>");
+  EXPECT_STREQ(
+      "struct<col0:tinyint,col1:smallint,col2:array<string>,"
+      "col3:map<float,double>,col4:float,"
+      "col5:int,col6:bigint,col7:string>",
+      HiveTypeSerializer::serialize(type).c_str());
+  auto typeWithId = TypeWithId::create(type);
+  EXPECT_EQ(0, typeWithId->id());
+  EXPECT_EQ(11, typeWithId->maxId());
+
+  std::vector<bool> selected(12);
+  selected[0] = true;
+  selected[2] = true;
+  auto selector = [&selected](size_t index) { return selected[index]; };
+  auto cutType = buildSelectedType(typeWithId, selector);
+  EXPECT_STREQ(
+      "struct<col1:smallint>",
+      HiveTypeSerializer::serialize(cutType->type()).c_str());
+  EXPECT_EQ(0, cutType->id());
+  EXPECT_EQ(11, cutType->maxId());
+  EXPECT_EQ(2, cutType->childAt(0)->maxId());
+
+  selected.assign(12, true);
+  cutType = buildSelectedType(typeWithId, selector);
+  EXPECT_STREQ(
+      "struct<col0:tinyint,col1:smallint,col2:array<string>,"
+      "col3:map<float,double>,col4:float,"
+      "col5:int,col6:bigint,col7:string>",
+      HiveTypeSerializer::serialize(cutType->type()).c_str());
+  EXPECT_EQ(0, cutType->id());
+  EXPECT_EQ(11, cutType->maxId());
+
+  selected.assign(12, false);
+  selected[0] = true;
+  selected[8] = true;
+  cutType = buildSelectedType(typeWithId, selector);
+  EXPECT_STREQ(
+      "struct<col4:float>",
+      HiveTypeSerializer::serialize(cutType->type()).c_str());
+  EXPECT_EQ(0, cutType->id());
+  EXPECT_EQ(11, cutType->maxId());
+  EXPECT_EQ(8, cutType->childAt(0)->id());
+  EXPECT_EQ(8, cutType->childAt(0)->maxId());
+
+  selected.assign(12, false);
+  selected[0] = true;
+  selected[3] = true;
+  EXPECT_THROW(buildSelectedType(typeWithId, selector), BoltUserError);
+
+  selected.assign(12, false);
+  selected[0] = true;
+  EXPECT_THROW(buildSelectedType(typeWithId, selector), BoltUserError);
+
+  selected.assign(12, false);
+  selected[0] = true;
+  selected[3] = true;
+  selected[4] = true;
+  cutType = buildSelectedType(typeWithId, selector);
+  EXPECT_STREQ(
+      "struct<col2:array<string>>",
+      HiveTypeSerializer::serialize(cutType->type()).c_str());
+
+  selected.assign(12, false);
+  selected[0] = true;
+  selected[3] = true;
+  EXPECT_THROW(buildSelectedType(typeWithId, selector), BoltUserError);
+
+  selected.assign(12, false);
+  selected[0] = true;
+  selected[5] = true;
+  selected[6] = true;
+  selected[7] = true;
+  cutType = buildSelectedType(typeWithId, selector);
+  EXPECT_STREQ(
+      "struct<col3:map<float,double>>",
+      HiveTypeSerializer::serialize(cutType->type()).c_str());
+  EXPECT_EQ(5, cutType->childAt(0)->id());
+  EXPECT_EQ(7, cutType->childAt(0)->maxId());
+
+  // TODO : Consider supporting partial selection of some compound types
+  selected.assign(12, false);
+  selected[0] = true;
+  selected[5] = true;
+  EXPECT_THROW(buildSelectedType(typeWithId, selector), BoltUserError);
+
+  selected.assign(12, false);
+  selected[0] = true;
+  selected[5] = true;
+  selected[6] = true;
+  EXPECT_THROW(buildSelectedType(typeWithId, selector), BoltUserError);
+
+  selected.assign(12, false);
+  selected[0] = true;
+  selected[5] = true;
+  selected[7] = true;
+  EXPECT_THROW(buildSelectedType(typeWithId, selector), BoltUserError);
+
+  selected.assign(12, false);
+  selected[0] = true;
+  selected[1] = true;
+  selected[11] = true;
+  cutType = buildSelectedType(typeWithId, selector);
+  EXPECT_STREQ(
+      "struct<col0:tinyint,col7:string>",
+      HiveTypeSerializer::serialize(cutType->type()).c_str());
+  EXPECT_EQ(1, cutType->childAt(0)->id());
+  EXPECT_EQ(1, cutType->childAt(0)->maxId());
+  EXPECT_EQ(11, cutType->childAt(1)->id());
+  EXPECT_EQ(11, cutType->childAt(1)->maxId());
+}
+
+TEST(TestType, buildTypeFromString) {
+  std::string typeStr = "struct<a:int,b:string,c:float,d:string>";
+  auto type = HiveTypeParser().parse(typeStr);
+  EXPECT_STREQ(typeStr.c_str(), HiveTypeSerializer::serialize(type).c_str());
+
+  typeStr = "map<boolean,float>";
+  type = HiveTypeParser().parse(typeStr);
+  EXPECT_STREQ(typeStr.c_str(), HiveTypeSerializer::serialize(type).c_str());
+
+  typeStr = "struct<a:bigint,b:struct<a:binary,b:timestamp>>";
+  type = HiveTypeParser().parse(typeStr);
+  EXPECT_STREQ(typeStr.c_str(), HiveTypeSerializer::serialize(type).c_str());
+
+  typeStr =
+      "struct<a:bigint,b:struct<a:binary,b:timestamp>,c:map<double,tinyint>>";
+  type = HiveTypeParser().parse(typeStr);
+  EXPECT_STREQ(typeStr.c_str(), HiveTypeSerializer::serialize(type).c_str());
+}
+
+TEST(TestType, typeCompatibility) {
+  // have one more file column and one more partition key
+  auto from = ROW({INTEGER()});
+  auto to = ROW({INTEGER(), REAL(), VARCHAR()});
+  checkTypeCompatibility(*from, *to, true);
+
+  // have incompatible type
+  to = ROW({REAL()});
+  EXPECT_THROW(checkTypeCompatibility(*from, *to, true), BoltUserError);
+
+  // last column as partition key which is incompatible with last column of
+  // the file
+  from = ROW({INTEGER(), REAL()});
+  to = ROW({INTEGER()});
+  checkTypeCompatibility(*from, *to, true);
+
+  // incompatible type but not selected is ok
+  from = ROW({INTEGER(), REAL()});
+  to = ROW({INTEGER(), VARCHAR()});
+  ColumnSelector cs{to, std::vector<uint64_t>{0}};
+  checkTypeCompatibility(*from, cs);
+
+  ColumnSelector cs2{to, std::vector<uint64_t>{1}};
+  EXPECT_THROW(checkTypeCompatibility(*from, cs2), BoltUserError);
+
+  from = ROW({ARRAY(INTEGER())});
+  to = ROW({ARRAY(DOUBLE())});
+  EXPECT_THROW(checkTypeCompatibility(*from, *to, true), BoltUserError);
+
+  from = ROW({MAP(VARCHAR(), INTEGER())});
+  to = ROW({MAP(VARCHAR(), DOUBLE())});
+  EXPECT_THROW(checkTypeCompatibility(*from, *to, true), BoltUserError);
+}
+
+TEST(TestType, typeCompatibilityWithErrorMessage) {
+  // have one more file column and one more partition key
+  auto from = ROW({INTEGER()});
+  auto to = ROW({REAL()});
+  ColumnSelector cs{to, std::vector<uint64_t>{0}};
+  std::string exceptionContext{"test error message"};
+  std::function<std::string()> errorMessageCreator = [&]() {
+    return exceptionContext;
+  };
+
+  std::string expectedMsg = fmt::format(
+      "{}, From Kind: {}, To Kind: {}", exceptionContext, "INTEGER", "REAL");
+  EXPECT_THROW(
+      {
+        try {
+          checkTypeCompatibility(*from, cs, errorMessageCreator);
+        } catch (const bytedance::bolt::BoltException& ex) {
+          EXPECT_NE(ex.message().find(expectedMsg), std::string::npos);
+          EXPECT_EQ(ex.errorCode(), "SCHEMA_MISMATCH");
+          EXPECT_TRUE(ex.isUserError());
+          throw;
+        }
+      },
+      BoltUserError);
+}
+
+TEST(TestType, typeColumns) {
+  auto type = HiveTypeParser().parse(
+      "struct<col0:tinyint,col1:smallint,col2:array<string>,"
+      "col3:map<float,double>,col4:float,"
+      "col5:int,col6:bigint,col7:struct<c1:tinyint,c2:map<int,float>>,col8:string>");
+  auto typeWithId = TypeWithId::create(type);
+  EXPECT_EQ(0, typeWithId->id());
+  EXPECT_EQ(0, typeWithId->column());
+  EXPECT_EQ(9, typeWithId->size());
+
+  EXPECT_EQ(0, typeWithId->childAt(0)->column());
+  EXPECT_EQ(0, typeWithId->childAt(0)->size());
+
+  EXPECT_EQ(1, typeWithId->childAt(1)->column());
+  EXPECT_EQ(0, typeWithId->childAt(1)->size());
+
+  EXPECT_EQ(2, typeWithId->childAt(2)->column());
+  EXPECT_EQ(1, typeWithId->childAt(2)->size());
+  EXPECT_EQ(2, typeWithId->childAt(2)->childAt(0)->column());
+
+  EXPECT_EQ(3, typeWithId->childAt(3)->column());
+  EXPECT_EQ(2, typeWithId->childAt(3)->size());
+  EXPECT_EQ(3, typeWithId->childAt(3)->childAt(0)->column());
+  EXPECT_EQ(3, typeWithId->childAt(3)->childAt(1)->column());
+  EXPECT_EQ(0, typeWithId->childAt(3)->childAt(0)->size());
+  EXPECT_EQ(0, typeWithId->childAt(3)->childAt(1)->size());
+
+  EXPECT_EQ(4, typeWithId->childAt(4)->column());
+  EXPECT_EQ(0, typeWithId->childAt(4)->size());
+
+  EXPECT_EQ(5, typeWithId->childAt(5)->column());
+  EXPECT_EQ(0, typeWithId->childAt(5)->size());
+
+  EXPECT_EQ(6, typeWithId->childAt(6)->column());
+  EXPECT_EQ(0, typeWithId->childAt(6)->size());
+
+  // Only root struct types should allocate column ids.
+  // Sub struct types should inherit column id and not
+  // allocate new ids
+  EXPECT_EQ(7, typeWithId->childAt(7)->column());
+  EXPECT_EQ(2, typeWithId->childAt(7)->size());
+  EXPECT_EQ(7, typeWithId->childAt(7)->childAt(0)->column());
+  EXPECT_EQ(7, typeWithId->childAt(7)->childAt(1)->column());
+  EXPECT_EQ(0, typeWithId->childAt(7)->childAt(0)->size());
+  EXPECT_EQ(2, typeWithId->childAt(7)->childAt(1)->size());
+  EXPECT_EQ(7, typeWithId->childAt(7)->childAt(1)->childAt(0)->column());
+  EXPECT_EQ(7, typeWithId->childAt(7)->childAt(1)->childAt(1)->column());
+
+  EXPECT_EQ(8, typeWithId->childAt(8)->column());
+  EXPECT_EQ(0, typeWithId->childAt(8)->size());
+
+  // Root, non-struct compound objects should not allocate column ids
+  // to child types
+  type = HiveTypeParser().parse("map<float,double>");
+  typeWithId = TypeWithId::create(type);
+  EXPECT_EQ(0, typeWithId->id());
+  EXPECT_EQ(0, typeWithId->column());
+  EXPECT_EQ(2, typeWithId->size());
+  EXPECT_EQ(0, typeWithId->childAt(0)->column());
+  EXPECT_EQ(0, typeWithId->childAt(1)->column());
+  EXPECT_EQ(0, typeWithId->childAt(0)->size());
+  EXPECT_EQ(0, typeWithId->childAt(1)->size());
+}
+
+TEST(TestType, typeParents) {
+  auto type = HiveTypeParser().parse(
+      "struct<col0:tinyint,col1:smallint,col2:array<string>,"
+      "col3:map<float,double>,col4:float,"
+      "col5:int,col6:bigint,col7:struct<c1:tinyint,c2:map<int,float>>,col8:string>");
+  auto typeWithId = TypeWithId::create(type);
+  EXPECT_EQ(0, typeWithId->id());
+  EXPECT_EQ(nullptr, typeWithId->parent());
+  EXPECT_EQ(9, typeWithId->size());
+
+  EXPECT_EQ(typeWithId.get(), typeWithId->childAt(0)->parent());
+  EXPECT_EQ(0, typeWithId->childAt(0)->size());
+
+  EXPECT_EQ(typeWithId.get(), typeWithId->childAt(1)->parent());
+  EXPECT_EQ(0, typeWithId->childAt(1)->size());
+
+  EXPECT_EQ(typeWithId.get(), typeWithId->childAt(2)->parent());
+  EXPECT_EQ(1, typeWithId->childAt(2)->size());
+  EXPECT_EQ(
+      typeWithId->childAt(2).get(),
+      typeWithId->childAt(2)->childAt(0)->parent());
+
+  EXPECT_EQ(typeWithId.get(), typeWithId->childAt(3)->parent());
+  EXPECT_EQ(2, typeWithId->childAt(3)->size());
+  EXPECT_EQ(
+      typeWithId->childAt(3).get(),
+      typeWithId->childAt(3)->childAt(0)->parent());
+  EXPECT_EQ(
+      typeWithId->childAt(3).get(),
+      typeWithId->childAt(3)->childAt(1)->parent());
+  EXPECT_EQ(0, typeWithId->childAt(3)->childAt(0)->size());
+  EXPECT_EQ(0, typeWithId->childAt(3)->childAt(1)->size());
+
+  EXPECT_EQ(typeWithId.get(), typeWithId->childAt(4)->parent());
+  EXPECT_EQ(0, typeWithId->childAt(4)->size());
+
+  EXPECT_EQ(typeWithId.get(), typeWithId->childAt(5)->parent());
+  EXPECT_EQ(0, typeWithId->childAt(5)->size());
+
+  EXPECT_EQ(typeWithId.get(), typeWithId->childAt(6)->parent());
+  EXPECT_EQ(0, typeWithId->childAt(6)->size());
+
+  EXPECT_EQ(typeWithId.get(), typeWithId->childAt(7)->parent());
+  EXPECT_EQ(2, typeWithId->childAt(7)->size());
+  EXPECT_EQ(
+      typeWithId->childAt(7).get(),
+      typeWithId->childAt(7)->childAt(0)->parent());
+  EXPECT_EQ(
+      typeWithId->childAt(7).get(),
+      typeWithId->childAt(7)->childAt(1)->parent());
+  EXPECT_EQ(0, typeWithId->childAt(7)->childAt(0)->size());
+  EXPECT_EQ(2, typeWithId->childAt(7)->childAt(1)->size());
+  EXPECT_EQ(
+      typeWithId->childAt(7)->childAt(1).get(),
+      typeWithId->childAt(7)->childAt(1)->childAt(0)->parent());
+  EXPECT_EQ(
+      typeWithId->childAt(7)->childAt(1).get(),
+      typeWithId->childAt(7)->childAt(1)->childAt(1)->parent());
+
+  EXPECT_EQ(typeWithId.get(), typeWithId->childAt(8)->parent());
+  EXPECT_EQ(0, typeWithId->childAt(8)->size());
+}

@@ -1,0 +1,193 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* --------------------------------------------------------------------------
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * This file has been modified by ByteDance Ltd. and/or its affiliates on
+ * 2025-11-11.
+ *
+ * Original file was released under the Apache License 2.0,
+ * with the full license text available at:
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This modified file is released under the same license.
+ * --------------------------------------------------------------------------
+ */
+
+#include "bolt/connectors/hive/PartitionIdGenerator.h"
+
+#include "bolt/connectors/hive/HivePartitionUtil.h"
+#include "bolt/dwio/catalog/fbhive/FileUtils.h"
+using namespace bytedance::bolt::dwio::catalog::fbhive;
+namespace bytedance::bolt::connector::hive {
+
+PartitionIdGenerator::PartitionIdGenerator(
+    const RowTypePtr& inputType,
+    std::vector<column_index_t> partitionChannels,
+    uint32_t maxPartitions,
+    memory::MemoryPool* pool,
+    bool partitionPathAsLowerCase)
+    : partitionChannels_(std::move(partitionChannels)),
+      maxPartitions_(maxPartitions),
+      partitionPathAsLowerCase_(partitionPathAsLowerCase) {
+  BOLT_USER_CHECK(
+      !partitionChannels_.empty(), "There must be at least one partition key.");
+  for (auto channel : partitionChannels_) {
+    hashers_.emplace_back(
+        exec::VectorHasher::create(inputType->childAt(channel), channel));
+  }
+
+  std::vector<TypePtr> partitionKeyTypes;
+  std::vector<std::string> partitionKeyNames;
+  for (auto channel : partitionChannels_) {
+    BOLT_USER_CHECK(
+        exec::VectorHasher::typeKindSupportsValueIds(
+            inputType->childAt(channel)->kind()),
+        "Unsupported partition type: {}.",
+        inputType->childAt(channel)->toString());
+    partitionKeyTypes.push_back(inputType->childAt(channel));
+    partitionKeyNames.push_back(inputType->nameOf(channel));
+  }
+
+  partitionValues_ = BaseVector::create<RowVector>(
+      ROW(std::move(partitionKeyNames), std::move(partitionKeyTypes)),
+      maxPartitions_,
+      pool);
+  for (auto& key : partitionValues_->children()) {
+    key->resize(maxPartitions_);
+  }
+}
+
+void PartitionIdGenerator::run(
+    const RowVectorPtr& input,
+    raw_vector<uint64_t>& result) {
+  const auto numRows = input->size();
+  result.resize(numRows);
+
+  // TODO Check that there are no nulls in the partition keys.
+
+  // Compute value IDs using VectorHashers and store these in 'result'.
+  computeValueIds(input, result);
+
+  // Convert value IDs in 'result' into partition IDs using partitionIds
+  // mapping. Update 'result' in place.
+
+  // TODO Optimize common use case where all records belong to the same
+  // partition. VectorHashers keep track of the number of unique values, hence,
+  // we can find out if there is only one unique value for each partition key.
+  for (auto i = 0; i < numRows; ++i) {
+    auto valueId = result[i];
+    auto it = partitionIds_.find(valueId);
+    if (it != partitionIds_.end()) {
+      result[i] = it->second;
+    } else {
+      uint64_t nextPartitionId = partitionIds_.size();
+      BOLT_USER_CHECK_LT(
+          nextPartitionId,
+          maxPartitions_,
+          "Exceeded limit of {} distinct partitions.",
+          maxPartitions_);
+
+      partitionIds_.emplace(valueId, nextPartitionId);
+      savePartitionValues(nextPartitionId, input, i);
+
+      result[i] = nextPartitionId;
+    }
+  }
+}
+
+std::string PartitionIdGenerator::partitionName(uint64_t partitionId) const {
+  return FileUtils::makePartName(
+      extractPartitionKeyValues(partitionValues_, partitionId),
+      partitionPathAsLowerCase_);
+}
+
+void PartitionIdGenerator::computeValueIds(
+    const RowVectorPtr& input,
+    raw_vector<uint64_t>& valueIds) {
+  allRows_.resize(input->size());
+  allRows_.setAll();
+
+  bool rehash = false;
+  for (auto& hasher : hashers_) {
+    auto partitionVector = input->childAt(hasher->channel())->loadedVector();
+    hasher->decode(*partitionVector, allRows_);
+    if (!hasher->computeValueIds(allRows_, valueIds)) {
+      rehash = true;
+    }
+  }
+
+  if (!rehash) {
+    return;
+  }
+
+  uint64_t multiplier = 1;
+  for (auto& hasher : hashers_) {
+    multiplier = hasher->typeKind() == TypeKind::BOOLEAN
+        ? hasher->enableValueRange(multiplier, 50)
+        : hasher->enableValueIds(multiplier, 50);
+
+    BOLT_CHECK_NE(
+        multiplier,
+        exec::VectorHasher::kRangeTooLarge,
+        "Number of requested IDs is out of range.");
+  }
+
+  for (auto& hasher : hashers_) {
+    const bool ok = hasher->computeValueIds(allRows_, valueIds);
+    BOLT_CHECK(ok);
+  }
+
+  updateValueToPartitionIdMapping();
+}
+
+void PartitionIdGenerator::updateValueToPartitionIdMapping() {
+  if (partitionIds_.empty()) {
+    return;
+  }
+
+  const auto numPartitions = partitionIds_.size();
+
+  partitionIds_.clear();
+
+  raw_vector<uint64_t> newValueIds(numPartitions);
+  SelectivityVector rows(numPartitions);
+  for (auto i = 0; i < hashers_.size(); ++i) {
+    auto& hasher = hashers_[i];
+    hasher->decode(*partitionValues_->childAt(i), rows);
+    const bool ok = hasher->computeValueIds(rows, newValueIds);
+    BOLT_CHECK(ok);
+  }
+
+  for (auto i = 0; i < numPartitions; ++i) {
+    partitionIds_.emplace(newValueIds[i], i);
+  }
+}
+
+void PartitionIdGenerator::savePartitionValues(
+    uint64_t partitionId,
+    const RowVectorPtr& input,
+    vector_size_t row) {
+  for (auto i = 0; i < partitionChannels_.size(); ++i) {
+    auto channel = partitionChannels_[i];
+    partitionValues_->childAt(i)->copy(
+        input->childAt(channel).get(), partitionId, row, 1);
+  }
+}
+
+} // namespace bytedance::bolt::connector::hive

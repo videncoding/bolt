@@ -1,0 +1,482 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* --------------------------------------------------------------------------
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * This file has been modified by ByteDance Ltd. and/or its affiliates on
+ * 2025-11-11.
+ *
+ * Original file was released under the Apache License 2.0,
+ * with the full license text available at:
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This modified file is released under the same license.
+ * --------------------------------------------------------------------------
+ */
+
+#include "bolt/dwio/common/SelectiveStructColumnReader.h"
+
+#include "bolt/dwio/common/ColumnLoader.h"
+#include "bolt/vector/tests/utils/VectorMaker.h"
+namespace bytedance::bolt::dwio::common {
+
+void SelectiveStructColumnReaderBase::filterRowGroups(
+    uint64_t rowGroupSize,
+    const dwio::common::StatsContext& context,
+    FormatData::FilterRowGroupsResult& result,
+    dwio::common::BufferedInput& input) const {
+  SelectiveColumnReader::filterRowGroups(rowGroupSize, context, result, input);
+  for (const auto& child : children_) {
+    child->filterRowGroups(rowGroupSize, context, result, input);
+  }
+}
+
+uint64_t SelectiveStructColumnReaderBase::skip(uint64_t numValues) {
+  auto numNonNulls = formatData_->skipNulls(numValues);
+  // 'readOffset_' of struct child readers is aligned with
+  // 'readOffset_' of the struct. The child readers may have fewer
+  // values since there is no value in children where the struct is
+  // null. But because struct nulls are injected as nulls in child
+  // readers, it is practical to keep the row numbers in terms of the
+  // enclosing struct.
+  //
+  // Setting the 'readOffset_' in children is recursive so that nested
+  // nullable structs, where inner structs may advance less because of
+  // nulls above them still end up on the same row in terms of top
+  // level rows.
+  for (auto& child : children_) {
+    if (child) {
+      child->skip(numNonNulls);
+      child->setReadOffsetRecursive(child->readOffset() + numValues);
+    }
+  }
+  return numValues;
+}
+
+void SelectiveStructColumnReaderBase::next(
+    uint64_t numValues,
+    VectorPtr& result,
+    const Mutation* mutation) {
+  if (children_.empty()) {
+    if (mutation && mutation->deletedRows) {
+      numValues -= bits::countBits(mutation->deletedRows, 0, numValues);
+    }
+
+    // no readers
+    // This can be either count(*) query or a query that select only
+    // constant columns (partition keys or columns missing from an old file
+    // due to schema evolution)
+    auto resultRowVector = std::dynamic_pointer_cast<RowVector>(result);
+    resultRowVector->unsafeResize(numValues);
+
+    auto& childSpecs = scanSpec_->children();
+    for (auto& childSpec : childSpecs) {
+      BOLT_CHECK(childSpec->isConstant());
+      if (childSpec->projectOut()) {
+        auto channel = childSpec->channel();
+        resultRowVector->childAt(channel) = BaseVector::wrapInConstant(
+            numValues, 0, childSpec->constantValue());
+      }
+    }
+    return;
+  }
+  auto oldSize = rows_.size();
+  rows_.resize(numValues);
+  if (numValues > oldSize) {
+    std::iota(&rows_[oldSize], &rows_[rows_.size()], oldSize);
+  }
+  mutation_ = mutation;
+  hasMutation_ = mutation && mutation->deletedRows;
+  read(readOffset_, rows_, nullptr);
+  getValues(outputRows(), &result);
+}
+
+void SelectiveStructColumnReaderBase::read(
+    int64_t offset,
+    const RowSet& rows,
+    const uint64_t* incomingNulls) {
+  numReads_ = scanSpec_->newRead();
+  prepareRead<char>(offset, rows, incomingNulls);
+  RowSet activeRows = rows;
+  if (hasMutation_) {
+    // We handle the mutation after prepareRead so that output rows and format
+    // specific initializations (e.g. RepDef in Parquet) are done properly.
+    BOLT_DCHECK(!nullsInReadRange_, "Only top level can have mutation");
+    BOLT_DCHECK_EQ(
+        rows.back(), rows.size() - 1, "Top level should have a dense row set");
+    bits::forEachUnsetBit(
+        mutation_->deletedRows, 0, rows.back() + 1, [&](auto i) {
+          addOutputRow(i);
+        });
+    if (outputRows_.empty()) {
+      readOffset_ = offset + rows.back() + 1;
+      return;
+    }
+    activeRows = outputRows_;
+  }
+  const uint64_t* structNulls =
+      nullsInReadRange_ ? nullsInReadRange_->as<uint64_t>() : nullptr;
+  // a struct reader may have a null/non-null filter
+  if (scanSpec_->filter()) {
+    auto kind = scanSpec_->filter()->kind();
+    BOLT_CHECK(
+        kind == bolt::common::FilterKind::kIsNull ||
+        kind == bolt::common::FilterKind::kIsNotNull);
+    filterNulls<int32_t>(
+        activeRows, kind == bolt::common::FilterKind::kIsNull, false);
+    if (outputRows_.empty()) {
+      recordParentNullsInChildren(offset, rows);
+      lazyVectorReadOffset_ = offset;
+      readOffset_ = offset + rows.back() + 1;
+      return;
+    }
+    activeRows = outputRows_;
+  }
+
+  auto& childSpecs = scanSpec_->children();
+  for (size_t i = 0; i < childSpecs.size(); ++i) {
+    auto& childSpec = childSpecs[i];
+    if (isChildConstant(*childSpec)) {
+      continue;
+    }
+    auto fieldIndex = childSpec->subscript();
+    auto reader = children_.at(fieldIndex);
+    if (reader->isTopLevel() && childSpec->projectOut() &&
+        !childSpec->hasFilter() && !childSpec->extractValues()) {
+      // Will make a LazyVector.
+      continue;
+    }
+    advanceFieldReader(reader, offset);
+    if (childSpec->hasFilter()) {
+      {
+        SelectivityTimer timer(childSpec->selectivity(), activeRows.size());
+
+        reader->resetInitTimeClocks();
+        reader->read(offset, activeRows, structNulls);
+
+        // Exclude initialization time.
+        timer.subtract(reader->initTimeClocks());
+
+        activeRows = reader->outputRows();
+        childSpec->selectivity().addOutput(activeRows.size());
+      }
+      if (activeRows.empty()) {
+        break;
+      }
+    } else {
+      reader->read(offset, activeRows, structNulls);
+    }
+  }
+
+  // If this adds nulls, the field readers will miss a value for each null added
+  // here.
+  recordParentNullsInChildren(offset, rows);
+
+  if (scanSpec_->hasFilter()) {
+    setOutputRows(activeRows);
+  }
+  lazyVectorReadOffset_ = offset;
+  readOffset_ = offset + rows.back() + 1;
+}
+
+void SelectiveStructColumnReaderBase::recordParentNullsInChildren(
+    int64_t offset,
+    const RowSet& rows) {
+  if (formatData_->parentNullsInLeaves()) {
+    return;
+  }
+  auto& childSpecs = scanSpec_->children();
+  for (auto i = 0; i < childSpecs.size(); ++i) {
+    auto& childSpec = childSpecs[i];
+    if (isChildConstant(*childSpec)) {
+      continue;
+    }
+    auto fieldIndex = childSpec->subscript();
+    auto reader = children_.at(fieldIndex);
+    reader->addParentNulls(
+        offset,
+        nullsInReadRange_ ? nullsInReadRange_->as<uint64_t>() : nullptr,
+        rows);
+  }
+}
+
+bool SelectiveStructColumnReaderBase::isChildConstant(
+    const bolt::common::ScanSpec& childSpec) const {
+  return childSpec.isConstant() || isChildMissing(childSpec);
+}
+
+bool SelectiveStructColumnReaderBase::isChildMissing(
+    const bolt::common::ScanSpec& childSpec) const {
+  if (isRoot_) {
+    return false;
+  }
+  if (childSpec.channel() == bolt::common::ScanSpec::kNoChannel ||
+      fileType_->type()->kind() == TypeKind::MAP) {
+    return false;
+  }
+  if (columnReaderOptions_.useColumnNamesForColumnMapping_) {
+    return !fileType_->containsChild(childSpec.fieldName());
+  }
+  return childSpec.channel() >= fileType_->size();
+}
+
+namespace {
+
+//   Recursively makes empty RowVectors for positions in 'children'
+//   where the corresponding child type in 'rowType' is a row. The
+//   reader expects RowVector outputs to be initialized so that the
+//   content corresponds to the query schema regardless of the file
+//   schema. An empty RowVector can have nullptr for all its non-row
+//   children.
+void fillRowVectorChildren(
+    memory::MemoryPool& pool,
+    const RowType& rowType,
+    std::vector<VectorPtr>& children) {
+  for (auto i = 0; i < children.size(); ++i) {
+    const auto& type = rowType.childAt(i);
+    if (type->isRow()) {
+      std::vector<VectorPtr> innerChildren(type->size());
+      fillRowVectorChildren(pool, type->asRow(), innerChildren);
+      children[i] = std::make_shared<RowVector>(
+          &pool, type, nullptr, 0, std::move(innerChildren));
+    }
+  }
+}
+
+VectorPtr tryReuseResult(const VectorPtr& result) {
+  if (!result.unique()) {
+    return nullptr;
+  }
+  switch (result->encoding()) {
+    case VectorEncoding::Simple::ROW:
+      // Do not call prepareForReuse as it would throw away constant vectors
+      // that can be reused.  Reusability of children should be checked in
+      // getValues of child readers (all readers other than struct are
+      // recreating the result vector on each batch currently, so no issue with
+      // reusability now).
+      result->reuseNulls();
+      result->clearContainingLazyAndWrapped();
+      return result;
+    case VectorEncoding::Simple::LAZY: {
+      auto& lazy = static_cast<const LazyVector&>(*result);
+      if (!lazy.isLoaded()) {
+        return nullptr;
+      }
+      return tryReuseResult(lazy.loadedVectorShared());
+    }
+    case VectorEncoding::Simple::DICTIONARY:
+      return tryReuseResult(result->valueVector());
+    default:
+      return nullptr;
+  }
+}
+
+void setConstantField(
+    const VectorPtr& constant,
+    vector_size_t size,
+    VectorPtr& field) {
+  if (field && field->isConstantEncoding() && field.unique() &&
+      field->size() > 0 && field->equalValueAt(constant.get(), 0, 0)) {
+    field->resize(size);
+  } else {
+    field = BaseVector::wrapInConstant(size, 0, constant);
+  }
+}
+
+void setNullField(
+    vector_size_t size,
+    VectorPtr& field,
+    const TypePtr& type,
+    memory::MemoryPool* pool) {
+  if (field && field->isConstantEncoding() && field.unique() &&
+      field->size() > 0 && field->isNullAt(0)) {
+    field->resize(size);
+  } else {
+    field = BaseVector::createNullConstant(type, size, pool);
+  }
+}
+
+} // namespace
+
+void SelectiveStructColumnReaderBase::getValues(
+    const RowSet& rows,
+    VectorPtr* result) {
+  BOLT_CHECK_NOT_NULL(
+      *result, "SelectiveStructColumnReaderBase expects a non-null result");
+
+  auto& rowType = fileType_->isDCMap() ? fileType_->type()->asRow()
+                                       : result->get()->type()->asRow();
+  if UNLIKELY (fileType_->isDCMap()) {
+    // In case of DCMap, a new RowVevctor is needed
+    // to read out all the underlying data
+    std::vector<VectorPtr> children(rowType.size());
+    fillRowVectorChildren(*result->get()->pool(), rowType, children);
+    *result = std::make_shared<RowVector>(
+        result->get()->pool(),
+        fileType_->type(),
+        nullptr,
+        0,
+        std::move(children));
+  } else {
+    BOLT_CHECK(
+        result->get()->type()->isRow(),
+        "Struct reader expects a result of type ROW.");
+
+    if (auto reused = tryReuseResult(*result)) {
+      *result = std::move(reused);
+    } else {
+      VLOG(1) << "Reallocating result row vector with " << rowType.size()
+              << " children";
+      std::vector<VectorPtr> children(rowType.size());
+      fillRowVectorChildren(*result->get()->pool(), rowType, children);
+      *result = std::make_shared<RowVector>(
+          result->get()->pool(),
+          result->get()->type(),
+          nullptr,
+          0,
+          std::move(children));
+    }
+  }
+
+  auto* resultRow = static_cast<RowVector*>(result->get());
+  resultRow->unsafeResize(rows.size());
+  if (!rows.size()) {
+    resetWhenFilterAll();
+    return;
+  }
+  if (nullsInReadRange_) {
+    auto readerNulls = nullsInReadRange_->as<uint64_t>();
+    auto* nulls = resultRow->mutableNulls(rows.size())->asMutable<uint64_t>();
+    for (size_t i = 0; i < rows.size(); ++i) {
+      bits::setBit(nulls, i, bits::isBitSet(readerNulls, rows[i]));
+    }
+  } else {
+    resultRow->clearNulls(0, rows.size());
+  }
+  bool lazyPrepared = false;
+  for (auto& childSpec : scanSpec_->children()) {
+    if (!childSpec->projectOut()) {
+      continue;
+    }
+    auto channel = childSpec->channel();
+    auto& childResult = resultRow->childAt(channel);
+    if (childSpec->isConstant()) {
+      setConstantField(childSpec->constantValue(), rows.size(), childResult);
+      continue;
+    }
+    auto index = childSpec->subscript();
+    // Set missing fields to be null constant, if we're in the top level struct
+    // missing columns should already be a null constant from the check above.
+    if (index == kConstantChildSpecSubscript) {
+      auto& childType = rowType.childAt(channel);
+      setNullField(rows.size(), childResult, childType, resultRow->pool());
+      continue;
+    }
+    if (childSpec->extractValues() || childSpec->hasFilter() ||
+        !children_[index]->isTopLevel()) {
+      children_[index]->getValues(rows, &childResult);
+      continue;
+    }
+    // LazyVector result.
+    if (!lazyPrepared) {
+      if (rows.size() != outputRows_.size()) {
+        setOutputRows(rows);
+      }
+      lazyPrepared = true;
+    }
+    auto loader =
+        std::make_unique<ColumnLoader>(this, children_[index], numReads_);
+    if (childResult && childResult->isLazy() && childResult.unique()) {
+      static_cast<LazyVector&>(*childResult)
+          .reset(std::move(loader), rows.size());
+    } else {
+      childResult = std::make_shared<LazyVector>(
+          &memoryPool_,
+          resultRow->type()->childAt(channel),
+          rows.size(),
+          std::move(loader),
+          std::move(childResult));
+    }
+  }
+  resultRow->updateContainsLazyNotLoaded();
+
+  if UNLIKELY (fileType_->isDCMap()) {
+    // In case of DCMap,
+    // a new combined map will be constructed
+    // all mapKV will be copied to resultVector.
+    auto dcKeys = fileType_->getDcKeys();
+
+    if (!dcKeys.empty() &&
+        dcKeys.find(scanSpec_->fieldName()) != dcKeys.end()) {
+      auto oldMap = resultRow->childAt(0)->as<MapVector>();
+      auto oldRow = resultRow->childAt(1)->as<RowVector>();
+      auto keys = dcKeys[scanSpec_->fieldName()];
+      BOLT_CHECK_EQ(oldRow->childrenSize(), keys.size());
+
+      std::vector<std::vector<std::pair<StringView, std::optional<StringView>>>>
+          combinedMap(resultRow->size());
+
+      if (oldMap && oldMap->mapKeys() && oldMap->mapValues()) {
+        auto oldMapKeys = oldMap->mapKeys()->as<SimpleVector<StringView>>();
+        auto oldMapValues = oldMap->mapValues()->as<SimpleVector<StringView>>();
+        BOLT_CHECK_NOT_NULL(oldMapKeys);
+        BOLT_CHECK_NOT_NULL(oldMapValues);
+        BOLT_CHECK_EQ(oldMapValues->size(), oldMapValues->size());
+
+        for (int rowIdx = 0; rowIdx < oldMap->size(); rowIdx++) {
+          if (!oldMap->isNullAt(rowIdx)) {
+            auto offset = oldMap->offsetAt(rowIdx);
+            auto size = oldMap->sizeAt(rowIdx);
+
+            for (int i = 0; i < size; i++) {
+              if (!oldMapKeys->isNullAt(offset + i) &&
+                  !oldMapValues->isNullAt(offset + i)) {
+                combinedMap[rowIdx].push_back(
+                    {oldMapKeys->valueAt(offset + i),
+                     oldMapValues->valueAt(offset + i)});
+              }
+            }
+          }
+        }
+      }
+
+      for (int colIdx = 0; colIdx < oldRow->childrenSize(); colIdx++) {
+        auto curCol =
+            oldRow->childAt(colIdx).get()->as<SimpleVector<StringView>>();
+        BOLT_CHECK_NOT_NULL(curCol);
+        for (int rowIdx = 0; rowIdx < curCol->size(); rowIdx++) {
+          if (!curCol->isNullAt(rowIdx)) {
+            combinedMap[rowIdx].push_back(
+                {StringView(keys[colIdx]), curCol->valueAt(rowIdx)});
+          }
+        }
+      }
+
+      bytedance::bolt::test::VectorMaker vectorMaker(&memoryPool_);
+      auto combinedKvPtr = vectorMaker.mapVector(
+          combinedMap,
+          MAP(CppToType<StringView>::create(),
+              CppToType<StringView>::create()));
+      *result = combinedKvPtr;
+    } else {
+      *result = resultRow->childAt(0);
+    }
+  }
+}
+
+} // namespace bytedance::bolt::dwio::common

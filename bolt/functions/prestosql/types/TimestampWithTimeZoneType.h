@@ -1,0 +1,143 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* --------------------------------------------------------------------------
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * This file has been modified by ByteDance Ltd. and/or its affiliates on
+ * 2025-11-11.
+ *
+ * Original file was released under the Apache License 2.0,
+ * with the full license text available at:
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This modified file is released under the same license.
+ * --------------------------------------------------------------------------
+ */
+
+#pragma once
+
+#include "bolt/expression/CastExpr.h"
+#include "bolt/type/Type.h"
+#include "bolt/vector/VectorTypeUtils.h"
+namespace bytedance::bolt {
+
+class TimestampWithTimeZoneCastOperator : public exec::CastOperator {
+ public:
+  static const std::shared_ptr<const CastOperator>& get() {
+    // mark `thread_local` keyword to avoid data race competition caused by
+    // multiple threads simultaneously manipulating member variables in static
+    thread_local const std::shared_ptr<const CastOperator> instance{
+        new TimestampWithTimeZoneCastOperator()};
+    return instance;
+  }
+
+  bool isSupportedFromType(const TypePtr& other) const override;
+
+  bool isSupportedToType(const TypePtr& other) const override;
+
+  void castTo(
+      const BaseVector& input,
+      exec::EvalCtx& context,
+      const SelectivityVector& rows,
+      const TypePtr& resultType,
+      VectorPtr& result) const override;
+
+  void castFrom(
+      const BaseVector& input,
+      exec::EvalCtx& context,
+      const SelectivityVector& rows,
+      const TypePtr& resultType,
+      VectorPtr& result) const override;
+
+ private:
+  TimestampWithTimeZoneCastOperator() = default;
+};
+
+/// Represents timestamp with time zone as a number of milliseconds since epoch
+/// and time zone ID.
+class TimestampWithTimeZoneType : public RowType {
+  TimestampWithTimeZoneType()
+      : RowType({"timestamp", "timezone"}, {BIGINT(), SMALLINT()}) {}
+
+ public:
+  static const std::shared_ptr<const TimestampWithTimeZoneType>& get() {
+    static const std::shared_ptr<const TimestampWithTimeZoneType> instance =
+        std::shared_ptr<TimestampWithTimeZoneType>(
+            new TimestampWithTimeZoneType());
+
+    return instance;
+  }
+
+  bool equivalent(const Type& other) const override {
+    // Pointer comparison works since this type is a singleton.
+    return this == &other;
+  }
+
+  const char* name() const override {
+    return "TIMESTAMP WITH TIME ZONE";
+  }
+
+  const std::vector<TypeParameter>& parameters() const override {
+    static const std::vector<TypeParameter> kEmpty = {};
+    return kEmpty;
+  }
+
+  std::string toString() const override {
+    return name();
+  }
+
+  folly::dynamic serialize() const override {
+    folly::dynamic obj = folly::dynamic::object;
+    obj["name"] = "Type";
+    obj["type"] = name();
+    return obj;
+  }
+};
+
+inline bool isTimestampWithTimeZoneType(const TypePtr& type) {
+  // Pointer comparison works since this type is a singleton.
+  return TimestampWithTimeZoneType::get() == type;
+}
+
+inline std::shared_ptr<const TimestampWithTimeZoneType>
+TIMESTAMP_WITH_TIME_ZONE() {
+  return TimestampWithTimeZoneType::get();
+}
+
+// Type used for function registration.
+struct TimestampWithTimezoneT {
+  using type = Row<int64_t, int16_t>;
+  static constexpr const char* typeName = "timestamp with time zone";
+};
+
+using TimestampWithTimezone = CustomType<TimestampWithTimezoneT>;
+
+class TimestampWithTimeZoneTypeFactories : public CustomTypeFactories {
+ public:
+  TypePtr getType() const override {
+    return TIMESTAMP_WITH_TIME_ZONE();
+  }
+
+  // Type casting from and to TimestampWithTimezone is not supported yet.
+  exec::CastOperatorPtr getCastOperator() const override {
+    return TimestampWithTimeZoneCastOperator::get();
+  }
+};
+
+void registerTimestampWithTimeZoneType();
+
+} // namespace bytedance::bolt

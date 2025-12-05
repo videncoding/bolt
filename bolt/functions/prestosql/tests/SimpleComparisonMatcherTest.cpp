@@ -1,0 +1,162 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* --------------------------------------------------------------------------
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * This file has been modified by ByteDance Ltd. and/or its affiliates on
+ * 2025-11-11.
+ *
+ * Original file was released under the Apache License 2.0,
+ * with the full license text available at:
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This modified file is released under the same license.
+ * --------------------------------------------------------------------------
+ */
+
+#include <gtest/gtest.h>
+
+#include "bolt/expression/VectorFunction.h"
+#include "bolt/functions/lib/SimpleComparisonMatcher.h"
+#include "bolt/functions/prestosql/registration/RegistrationFunctions.h"
+#include "bolt/parse/Expressions.h"
+#include "bolt/parse/ExpressionsParser.h"
+#include "bolt/parse/TypeResolver.h"
+#include "bolt/vector/tests/utils/VectorTestBase.h"
+namespace bytedance::bolt::functions::prestosql {
+namespace {
+
+class SimpleComparisonMatcherTest : public testing::Test,
+                                    public test::VectorTestBase {
+ protected:
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
+  }
+
+  void SetUp() override {
+    functions::prestosql::registerAllScalarFunctions(prefix_);
+    parse::registerTypeResolver();
+  }
+
+  core::TypedExprPtr parseExpression(
+      const std::string& text,
+      const RowTypePtr& rowType) {
+    parse::ParseOptions options;
+    options.functionPrefix = prefix_;
+    auto untyped = parse::parseExpr(text, options);
+    return core::Expressions::inferTypes(untyped, rowType, execCtx_->pool());
+  }
+
+  std::shared_ptr<core::QueryCtx> queryCtx_{core::QueryCtx::create()};
+  std::unique_ptr<core::ExecCtx> execCtx_{
+      std::make_unique<core::ExecCtx>(pool_.get(), queryCtx_.get())};
+  const std::string prefix_ = "tp.";
+};
+
+class TestFunction : public exec::VectorFunction {
+ public:
+  void apply(
+      const SelectivityVector& rows,
+      std::vector<VectorPtr>& args,
+      const TypePtr& /* outputType */,
+      exec::EvalCtx& context,
+      VectorPtr& result) const override {
+    BOLT_UNSUPPORTED();
+  }
+
+  static std::vector<std::shared_ptr<exec::FunctionSignature>> signatures() {
+    return {exec::FunctionSignatureBuilder()
+                .typeVariable("T")
+                .returnType("array(T)")
+                .argumentType("array(T)")
+                .argumentType("function(T,T,bigint)")
+                .build()};
+  }
+};
+
+TEST_F(SimpleComparisonMatcherTest, basic) {
+  exec::registerVectorFunction(
+      prefix_ + "test_array_sort",
+      TestFunction::signatures(),
+      std::make_unique<TestFunction>());
+
+  const auto inputType =
+      ROW({"a"}, {ARRAY(ROW({"f", "g"}, {BIGINT(), BIGINT()}))});
+
+  auto checker = std::make_unique<SimpleComparisonChecker>();
+
+  auto testMatcher = [&](const std::string& expr,
+                         std::optional<bool> lessThan) {
+    SCOPED_TRACE(expr);
+    auto parsedExpr = parseExpression(
+        fmt::format("test_array_sort(a, (x, y) -> {})", expr), inputType);
+
+    auto lambdaExpr = std::dynamic_pointer_cast<const core::LambdaTypedExpr>(
+        parsedExpr->inputs()[1]);
+
+    auto comparison = checker->isSimpleComparison(prefix_, *lambdaExpr);
+
+    ASSERT_EQ(lessThan.has_value(), comparison.has_value());
+    if (lessThan.has_value()) {
+      ASSERT_EQ(lessThan.value(), comparison->isLessThen);
+
+      auto field = dynamic_cast<const core::DereferenceTypedExpr*>(
+          comparison->expr.get());
+      ASSERT_TRUE(field != nullptr);
+      ASSERT_EQ(0, field->index());
+    }
+  };
+
+  // Different ways to define x < y (asc) sort order.
+  testMatcher("if(x.f > y.f, 1, if(x.f < y.f, -1, 0))", true);
+  testMatcher("if(x.f > y.f, 1, if(y.f > x.f, -1, 0))", true);
+  testMatcher("if(x.f > y.f, 1, if(x.f = y.f, 0, -1))", true);
+
+  testMatcher("if(x.f < y.f, -1, if(x.f > y.f, 1, 0))", true);
+  testMatcher("if(x.f < y.f, -1, if(y.f < x.f, 1, 0))", true);
+  testMatcher("if(x.f < y.f, -1, if(x.f = y.f, 0, 1))", true);
+
+  testMatcher("if(x.f = y.f, 0, if(x.f < y.f, -1, 1))", true);
+  testMatcher("if(x.f = y.f, 0, if(y.f > x.f, -1, 1))", true);
+  testMatcher("if(x.f = y.f, 0, if(x.f > y.f, 1, -1))", true);
+  testMatcher("if(x.f = y.f, 0, if(y.f < x.f, 1, -1))", true);
+
+  // Different ways to define x > y (desc) sort order.
+  testMatcher("if (x.f < y.f, 1, if (x.f > y.f, -1, 0))", false);
+  testMatcher("if (x.f < y.f, 1, if (y.f < x.f, -1, 0))", false);
+  testMatcher("if (x.f < y.f, 1, if (y.f = x.f, 0, -1))", false);
+
+  testMatcher("if (x.f > y.f, -1, if (x.f < y.f, 1, 0))", false);
+  testMatcher("if (x.f > y.f, -1, if (y.f > x.f, 1, 0))", false);
+  testMatcher("if (x.f > y.f, -1, if (y.f = x.f, 0, 1))", false);
+
+  testMatcher("if(x.f = y.f, 0, if(x.f < y.f, 1, -1))", false);
+  testMatcher("if(x.f = y.f, 0, if(y.f > x.f, 1, -1))", false);
+  testMatcher("if(x.f = y.f, 0, if(x.f > y.f, -1, 1))", false);
+  testMatcher("if(x.f = y.f, 0, if(y.f < x.f, -1, 1))", false);
+
+  // Non-matching expressions.
+  testMatcher("if(x.f + y.f > 0, 1, -1)", std::nullopt);
+  testMatcher("if(x.f < y.f, 1, -1)", std::nullopt);
+  testMatcher("if(x.f = y.f, 0, if(x.f > y.f, -1, 0))", std::nullopt);
+  testMatcher("if(x.f = y.f, 1, if(x.f > y.f, -1, 0))", std::nullopt);
+  testMatcher("if(x.f > (y.f + 5), 1, if(x.f < y.f, -1, 0))", std::nullopt);
+  testMatcher("x.f + y.f", std::nullopt);
+}
+
+} // namespace
+} // namespace bytedance::bolt::functions::prestosql

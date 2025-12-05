@@ -1,0 +1,425 @@
+/*
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <iostream>
+
+#include <common/memory/Allocation.h>
+#include <folly/Benchmark.h>
+#include <folly/init/Init.h>
+#include <sys/stat.h>
+#include "bolt/common/memory/Memory.h"
+
+// #define PRESSURE
+// #define PRESSURE2
+
+#ifdef PRESSURE
+DEFINE_int64(memory_allocation_count, 1000, "The number of allocations");
+DEFINE_int64(
+    memory_allocation_bytes,
+    51'539'607'552,
+    "The cap of memory allocation bytes");
+DEFINE_int64(
+    allocation_size_seed,
+    99887766,
+    "Seed for random memory size generator");
+DEFINE_int64(
+    memory_free_every_n_operations,
+    1000,
+    "Specifies memory free for every N operations. If it is 5, then we free one of existing memory allocation for every 5 memory operations");
+
+#else
+DEFINE_int64(memory_allocation_count, 1000, "The number of allocations");
+DEFINE_int64(
+    memory_allocation_bytes,
+    1'000'000'000,
+    "The cap of memory allocation bytes");
+DEFINE_int64(
+    allocation_size_seed,
+    99887766,
+    "Seed for random memory size generator");
+DEFINE_int64(
+    memory_free_every_n_operations,
+    5,
+    "Specifies memory free for every N operations. If it is 5, then we free one of existing memory allocation for every 5 memory operations");
+#endif
+using namespace bytedance::bolt;
+using namespace bytedance::bolt::memory;
+
+namespace {
+
+enum class Type {
+  kStd = 0,
+  kMmap = 1,
+};
+
+class MemoryPoolReallocateContiguousBenchMark {
+ public:
+  MemoryPoolReallocateContiguousBenchMark(
+      Type type,
+      uint16_t alignment,
+      size_t minSize,
+      size_t maxSize)
+      : type_(type), minSize_(minSize), maxSize_(maxSize) {
+    switch (type_) {
+      case Type::kMmap:
+        manager_ = std::make_shared<MemoryManager>(
+            MemoryManager::Options{.alignment = alignment});
+        break;
+      case Type::kStd:
+        manager_ = std::make_shared<MemoryManager>(
+            MemoryManager::Options{.alignment = alignment});
+        break;
+      default:
+        BOLT_USER_FAIL("Unknown allocator type: {}", static_cast<int>(type_));
+        break;
+    }
+    rng_.seed(FLAGS_allocation_size_seed);
+    pool_ = manager_->addLeafPool("MemoryPoolReallocateContiguousBenchMark");
+  }
+
+  ~MemoryPoolReallocateContiguousBenchMark() {
+    while (!empty()) {
+      free();
+    }
+  }
+
+  size_t runAllocate();
+
+  size_t runAllocateContiguous();
+  size_t runReallocateContiguous();
+  size_t runAllocateContiguousOnce();
+
+  size_t runAllocateZeroFilled();
+
+  size_t runReallocate();
+
+  size_t runReallocateLarger();
+
+ private:
+  struct Allocation {
+    void* ptr;
+    size_t size;
+
+    Allocation(void* _ptr, size_t _size) : ptr(_ptr), size(_size) {}
+  };
+
+  void allocate() {
+    const size_t size = allocSize();
+    allocations_.emplace_back(pool_->allocate(size), size);
+    ++numAllocs_;
+    sumAllocBytes_ += size;
+  }
+
+  void allocateContiguous(MachinePageCount numPage) {
+    memory::ContiguousAllocation contiguousAllocation;
+    size_t size = numPage * AllocationTraits::kPageSize;
+    pool_->allocateContiguous(numPage, contiguousAllocation);
+    char** table_ = contiguousAllocation.data<char*>();
+    memset(table_, 0, size);
+    contiguousAllocations_.emplace_back(std::move(contiguousAllocation));
+    ++numAllocs_;
+    sumAllocBytes_ += size;
+  }
+
+  void reallocateContiguous(
+      MachinePageCount oldNumPage,
+      MachinePageCount newNumPage) {
+    memory::ContiguousAllocation contiguousAllocation;
+    size_t oldSize = oldNumPage * AllocationTraits::kPageSize;
+    size_t newSize = newNumPage * AllocationTraits::kPageSize;
+    pool_->allocateContiguous(oldNumPage, contiguousAllocation);
+    char** oldTable = contiguousAllocation.data<char*>();
+    memset(oldTable, 0, oldSize);
+    pool_->allocateContiguous(newNumPage, contiguousAllocation);
+    if (contiguousAllocation.pool() == nullptr ||
+        contiguousAllocation.data() == nullptr) {
+    }
+    char** newTable = contiguousAllocation.data<char*>();
+    memset(newTable, 0, oldSize);
+    contiguousAllocations_.emplace_back(std::move(contiguousAllocation));
+    ++numAllocs_;
+    sumAllocBytes_ += newSize;
+  }
+
+  void allocateZeroFilled() {
+    const size_t size = allocSize();
+    const size_t numEntries = 1 + folly::Random::rand32(size, rng_);
+    const size_t sizeEach = size / numEntries;
+    allocations_.emplace_back(
+        pool_->allocateZeroFilled(numEntries, sizeEach), numEntries * sizeEach);
+    ++numAllocs_;
+    sumAllocBytes_ += numEntries * sizeEach;
+  }
+
+  void reallocate(const size_t oldSize, const size_t newSize) {
+    void* oldPtr = pool_->allocate(oldSize);
+    char* charPtr = static_cast<char*>(oldPtr);
+    void* newPtr = pool_->reallocate(oldPtr, oldSize, newSize);
+    allocations_.emplace_back(newPtr, newSize);
+    ++numAllocs_;
+    sumAllocBytes_ += newSize;
+  }
+
+  void reallocateLarger() {
+    const size_t oldSize = allocSize();
+    const size_t newSize = 1.5 * oldSize;
+    void* oldPtr = pool_->allocate(oldSize);
+    char* charPtr = static_cast<char*>(oldPtr);
+    void* newPtr = pool_->reallocate(oldPtr, oldSize, newSize);
+    allocations_.emplace_back(newPtr, newSize);
+    ++numAllocs_;
+    sumAllocBytes_ += newSize;
+  }
+
+  void free() {
+    Allocation allocation = allocations_.front();
+    allocations_.pop_front();
+    pool_->free(allocation.ptr, allocation.size);
+    sumAllocBytes_ -= allocation.size;
+  }
+
+  void freeContiguous() {
+    ContiguousAllocation contiguousAllocation =
+        std::move(contiguousAllocations_.front());
+    contiguousAllocations_.pop_front();
+    size_t size = contiguousAllocation.maxSize();
+    pool_->freeContiguous(contiguousAllocation);
+    sumAllocBytes_ -= size;
+  }
+
+  bool full() const {
+    return sumAllocBytes_ >= FLAGS_memory_allocation_bytes;
+  }
+
+  bool empty() const {
+    return allocations_.empty();
+  }
+
+  bool contiguousAllocationEmpty() const {
+    auto res = contiguousAllocations_.empty();
+    return res;
+  }
+
+  size_t allocSize() {
+    return minSize_ + folly::Random::rand32(maxSize_ - minSize_ + 1, rng_);
+  }
+
+  const Type type_;
+  const size_t minSize_;
+  const size_t maxSize_;
+  folly::Random::DefaultGenerator rng_;
+  std::shared_ptr<MemoryManager> manager_;
+  std::shared_ptr<MemoryPool> pool_;
+  uint64_t sumAllocBytes_{0};
+  uint64_t numAllocs_{0};
+  std::deque<Allocation> allocations_;
+  std::deque<ContiguousAllocation> contiguousAllocations_;
+  std::vector<MachinePageCount> allocPages_;
+  std::vector<MachinePageCount> reallocPages_;
+};
+
+size_t MemoryPoolReallocateContiguousBenchMark::runAllocate() {
+  folly::BenchmarkSuspender suspender;
+  suspender.dismiss();
+  for (auto iter = 0; iter < FLAGS_memory_allocation_count; ++iter) {
+    if (iter % FLAGS_memory_free_every_n_operations == 0 && !empty()) {
+      free();
+    }
+    while (full()) {
+      free();
+    }
+    allocate();
+  }
+  return FLAGS_memory_allocation_count;
+}
+
+size_t MemoryPoolReallocateContiguousBenchMark::runReallocateContiguous() {
+  for (int i = 0; i < 100; i++) {
+    allocPages_.emplace_back(allocSize());
+  }
+
+  folly::BenchmarkSuspender suspender;
+  suspender.dismiss();
+  for (auto iter = 0; iter < FLAGS_memory_allocation_count; ++iter) {
+    if (iter % FLAGS_memory_free_every_n_operations == 0 &&
+        !contiguousAllocationEmpty()) {
+      freeContiguous();
+    }
+    while (full()) {
+      freeContiguous();
+    }
+    reallocateContiguous(
+        allocPages_[iter % 100], allocPages_[iter % 100] * 1.5);
+  }
+  allocPages_.clear();
+  return FLAGS_memory_allocation_count;
+}
+
+size_t MemoryPoolReallocateContiguousBenchMark::runAllocateContiguous() {
+  for (int i = 0; i < 100; i++) {
+    allocPages_.emplace_back(allocSize());
+  }
+
+  folly::BenchmarkSuspender suspender;
+  suspender.dismiss();
+  for (auto iter = 0; iter < FLAGS_memory_allocation_count; ++iter) {
+    if (iter % FLAGS_memory_free_every_n_operations == 0 &&
+        !contiguousAllocationEmpty()) {
+      freeContiguous();
+    }
+    while (full()) {
+      freeContiguous();
+    }
+    allocateContiguous(allocPages_[iter % 100]);
+  }
+  allocPages_.clear();
+  return FLAGS_memory_allocation_count;
+}
+
+size_t MemoryPoolReallocateContiguousBenchMark::runAllocateContiguousOnce() {
+  allocateContiguous(10485760);
+  return 1;
+}
+
+size_t MemoryPoolReallocateContiguousBenchMark::runReallocate() {
+  for (int i = 0; i < 100; i++) {
+    allocPages_.emplace_back(allocSize());
+    reallocPages_.emplace_back(allocSize());
+  }
+
+  folly::BenchmarkSuspender suspender;
+  suspender.dismiss();
+  for (auto iter = 0; iter < FLAGS_memory_allocation_count; ++iter) {
+    if (iter % FLAGS_memory_free_every_n_operations == 0 && !empty()) {
+      free();
+    }
+    while (full()) {
+      free();
+    }
+    reallocate(allocPages_[iter % 100], reallocPages_[iter % 100]);
+  }
+  allocPages_.clear();
+  reallocPages_.clear();
+  return FLAGS_memory_allocation_count;
+}
+
+size_t MemoryPoolReallocateContiguousBenchMark::runReallocateLarger() {
+  for (int i = 0; i < 100; i++) {
+    allocPages_.emplace_back(allocSize());
+  }
+  folly::BenchmarkSuspender suspender;
+  suspender.dismiss();
+  for (auto iter = 0; iter < FLAGS_memory_allocation_count; ++iter) {
+    if (iter % FLAGS_memory_free_every_n_operations == 0 && !empty()) {
+      free();
+    }
+    while (full()) {
+      free();
+    }
+    reallocate(allocPages_[iter % 100], allocPages_[iter % 100] * 1.5);
+  }
+  allocPages_.clear();
+  return FLAGS_memory_allocation_count;
+}
+
+// benchmark for allocateContiguous
+#ifdef PRESSURE2
+BENCHMARK_MULTI(StdAllocateInitialAlloc40G) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(Type::kStd, 16, 1, 512);
+  return benchmark.runAllocateContiguousOnce();
+}
+#endif
+BENCHMARK_MULTI(StdAllocateContiguousSmallNoAlignment2M) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(Type::kStd, 16, 1, 512);
+  return benchmark.runReallocateContiguous();
+}
+BENCHMARK_MULTI(StdAllocateContiguousSmall2M) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(Type::kStd, 64, 1, 512);
+  return benchmark.runAllocateContiguous();
+}
+BENCHMARK_MULTI(StdAllocateContiguousSmallNoAlignment2MTo4M) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(Type::kStd, 16, 512, 1024);
+  return benchmark.runAllocateContiguous();
+}
+BENCHMARK_MULTI(StdAllocateContiguousSmall2MTo4M) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(Type::kStd, 64, 512, 1024);
+  return benchmark.runAllocateContiguous();
+}
+BENCHMARK_MULTI(StdAllocateContiguousSmallNoAlignment4MTo8M) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(Type::kStd, 16, 1024, 2048);
+  return benchmark.runAllocateContiguous();
+}
+BENCHMARK_MULTI(StdAllocateContiguousSmall4MTo8M) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(Type::kStd, 64, 1024, 2048);
+  return benchmark.runAllocateContiguous();
+}
+BENCHMARK_MULTI(StdAllocateContiguousNoAlignment8MTo16M) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(Type::kStd, 16, 2048, 4096);
+  return benchmark.runReallocateContiguous();
+}
+BENCHMARK_MULTI(StdAllocateContiguous8MTo16M) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(Type::kStd, 64, 2048, 4096);
+  return benchmark.runReallocateContiguous();
+}
+BENCHMARK_MULTI(StdAllocateContiguousNoAlignment16MTo32M) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(Type::kStd, 16, 4096, 8192);
+  return benchmark.runReallocateContiguous();
+}
+BENCHMARK_MULTI(StdAllocateContiguous16MTo32M) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(Type::kStd, 64, 4096, 8192);
+  return benchmark.runReallocateContiguous();
+}
+BENCHMARK_MULTI(StdAllocateContiguousNoAlignment32MTo64M) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(
+      Type::kStd, 16, 8192, 16384);
+  return benchmark.runReallocateContiguous();
+}
+BENCHMARK_MULTI(StdAllocateContiguous32MTo64M) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(
+      Type::kStd, 64, 8192, 16384);
+  return benchmark.runReallocateContiguous();
+}
+BENCHMARK_MULTI(StdAllocateContiguousNoAlignment64MTo128M) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(
+      Type::kStd, 16, 16384, 32768);
+  return benchmark.runReallocateContiguous();
+}
+BENCHMARK_MULTI(StdAllocateContiguous64MTo128M) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(
+      Type::kStd, 64, 16384, 32768);
+  return benchmark.runReallocateContiguous();
+}
+BENCHMARK_MULTI(StdAllocateContiguousNoAlignment128MTo1G) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(
+      Type::kStd, 16, 32768, 262144);
+  return benchmark.runReallocateContiguous();
+}
+BENCHMARK_MULTI(StdAllocateContiguous128MTo1G) {
+  MemoryPoolReallocateContiguousBenchMark benchmark(
+      Type::kStd, 64, 32768, 262144);
+  return benchmark.runReallocateContiguous();
+}
+} // namespace
+
+int main(int argc, char* argv[]) {
+  folly::init(&argc, &argv);
+  folly::runBenchmarks();
+  return 0;
+}

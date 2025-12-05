@@ -1,0 +1,321 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* --------------------------------------------------------------------------
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * This file has been modified by ByteDance Ltd. and/or its affiliates on
+ * 2025-11-11.
+ *
+ * Original file was released under the Apache License 2.0,
+ * with the full license text available at:
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This modified file is released under the same license.
+ * --------------------------------------------------------------------------
+ */
+
+#include "bolt/exec/ContainerRowSerde.h"
+#include "bolt/expression/FunctionSignature.h"
+#include "bolt/functions/InlineFlatten.h"
+#include "bolt/functions/lib/aggregates/ValueList.h"
+#include "bolt/functions/prestosql/aggregates/AggregateNames.h"
+namespace bytedance::bolt::aggregate::prestosql {
+namespace {
+
+struct ArrayAccumulator {
+  ValueList elements;
+};
+
+template <bool ignoreAllNulls>
+class ArrayAggAggregate : public exec::Aggregate {
+ public:
+  explicit ArrayAggAggregate(TypePtr resultType, bool ignoreNulls)
+      : Aggregate(resultType), ignoreNulls_(ignoreNulls) {}
+
+  int32_t accumulatorFixedWidthSize() const final {
+    return sizeof(ArrayAccumulator);
+  }
+
+  bool isFixedSize() const final {
+    return false;
+  }
+
+  bool supportsToIntermediate() const final {
+    return true;
+  }
+
+  FLATTEN void toIntermediate(
+      const SelectivityVector& rows,
+      std::vector<VectorPtr>& args,
+      VectorPtr& result) const final {
+    const auto& elements = args[0];
+
+    const auto numRows = rows.size();
+
+    // Convert input to a single-entry array.
+
+    // Set nulls for rows not present in 'rows'.
+    auto* pool = allocator_->pool();
+    BufferPtr nulls = allocateNulls(numRows, pool);
+    auto mutableNulls = nulls->asMutable<uint64_t>();
+    memcpy(
+        nulls->asMutable<uint64_t>(),
+        rows.asRange().bits(),
+        bits::nbytes(numRows));
+
+    auto loadedElements = BaseVector::loadedVectorShared(elements);
+
+    if constexpr (ignoreAllNulls) {
+      if (loadedElements->mayHaveNulls()) {
+        rows.applyToSelected([&](vector_size_t row) {
+          if (loadedElements->isNullAt(row)) {
+            bits::setNull(mutableNulls, row);
+          }
+        });
+      }
+    } else {
+      if (ignoreNulls_ && loadedElements->mayHaveNulls()) {
+        rows.applyToSelected([&](vector_size_t row) {
+          if (loadedElements->isNullAt(row)) {
+            bits::setNull(mutableNulls, row);
+          }
+        });
+      }
+    }
+
+    // Set offsets to 0, 1, 2, 3...
+    BufferPtr offsets = allocateOffsets(numRows, pool);
+    auto* rawOffsets = offsets->asMutable<vector_size_t>();
+    std::iota(rawOffsets, rawOffsets + numRows, 0);
+
+    // Set sizes to 1.
+    BufferPtr sizes = allocateSizes(numRows, pool);
+    auto* rawSizes = sizes->asMutable<vector_size_t>();
+    std::fill(rawSizes, rawSizes + numRows, 1);
+
+    result = std::make_shared<ArrayVector>(
+        pool,
+        ARRAY(elements->type()),
+        nulls,
+        numRows,
+        offsets,
+        sizes,
+        loadedElements);
+  }
+
+  void initializeNewGroups(
+      char** groups,
+      folly::Range<const vector_size_t*> indices) final {
+    for (auto index : indices) {
+      new (groups[index] + offset_) ArrayAccumulator();
+    }
+  }
+
+  FLATTEN void
+  extractValues(char** groups, int32_t numGroups, VectorPtr* result) final {
+    auto vector = (*result)->as<ArrayVector>();
+    BOLT_CHECK(vector);
+    vector->resize(numGroups);
+
+    auto elements = vector->elements();
+    elements->resize(countElements(groups, numGroups));
+
+    uint64_t* rawNulls = getRawNulls(vector);
+    vector_size_t offset = 0;
+    for (int32_t i = 0; i < numGroups; ++i) {
+      auto& values = value<ArrayAccumulator>(groups[i])->elements;
+      auto arraySize = values.size();
+      if (arraySize) {
+        clearNull(rawNulls, i);
+
+        ValueListReader reader(values);
+        for (auto index = 0; index < arraySize; ++index) {
+          reader.next(*elements, offset + index);
+        }
+        vector->setOffsetAndSize(i, offset, arraySize);
+        offset += arraySize;
+      } else {
+        if constexpr (ignoreAllNulls) {
+          vector->setNull(i, false);
+          vector->setOffsetAndSize(i, offset, 0);
+          continue;
+        }
+        vector->setNull(i, true);
+      }
+    }
+  }
+
+  FLATTEN void extractAccumulators(
+      char** groups,
+      int32_t numGroups,
+      VectorPtr* result) final {
+    extractValues(groups, numGroups, result);
+  }
+
+  FLATTEN void addRawInput(
+      char** groups,
+      const SelectivityVector& rows,
+      const std::vector<VectorPtr>& args,
+      bool /*mayPushdown*/) final {
+    decodedElements_.decode(*args[0], rows);
+    rows.applyToSelected([&](vector_size_t row) {
+      if constexpr (ignoreAllNulls) {
+        if (decodedElements_.isNullAt(row)) {
+          return;
+        }
+      } else {
+        if (ignoreNulls_ && decodedElements_.isNullAt(row)) {
+          return;
+        }
+      }
+      auto group = groups[row];
+      auto tracker = trackRowSize(group);
+      value<ArrayAccumulator>(group)->elements.appendValue(
+          decodedElements_, row, allocator_);
+    });
+  }
+
+  FLATTEN void addIntermediateResults(
+      char** groups,
+      const SelectivityVector& rows,
+      const std::vector<VectorPtr>& args,
+      bool /*mayPushdown*/) final {
+    decodedIntermediate_.decode(*args[0], rows);
+
+    auto arrayVector = decodedIntermediate_.base()->as<ArrayVector>();
+    auto& elements = arrayVector->elements();
+    rows.applyToSelected([&](vector_size_t row) {
+      auto group = groups[row];
+      auto decodedRow = decodedIntermediate_.index(row);
+      auto tracker = trackRowSize(group);
+      if (!decodedIntermediate_.isNullAt(row)) {
+        value<ArrayAccumulator>(group)->elements.appendRange(
+            elements,
+            arrayVector->offsetAt(decodedRow),
+            arrayVector->sizeAt(decodedRow),
+            allocator_);
+      }
+    });
+  }
+
+  void addSingleGroupRawInput(
+      char* group,
+      const SelectivityVector& rows,
+      const std::vector<VectorPtr>& args,
+      bool /* mayPushdown */) final {
+    auto& values = value<ArrayAccumulator>(group)->elements;
+
+    decodedElements_.decode(*args[0], rows);
+    auto tracker = trackRowSize(group);
+    rows.applyToSelected([&](vector_size_t row) {
+      if constexpr (ignoreAllNulls) {
+        if (decodedElements_.isNullAt(row)) {
+          return;
+        }
+      } else {
+        if (ignoreNulls_ && decodedElements_.isNullAt(row)) {
+          return;
+        }
+      }
+      values.appendValue(decodedElements_, row, allocator_);
+    });
+  }
+
+  void addSingleGroupIntermediateResults(
+      char* group,
+      const SelectivityVector& rows,
+      const std::vector<VectorPtr>& args,
+      bool /* mayPushdown */) final {
+    decodedIntermediate_.decode(*args[0], rows);
+    auto arrayVector = decodedIntermediate_.base()->as<ArrayVector>();
+
+    auto& values = value<ArrayAccumulator>(group)->elements;
+    auto elements = arrayVector->elements();
+    rows.applyToSelected([&](vector_size_t row) {
+      if (!decodedIntermediate_.isNullAt(row)) {
+        auto decodedRow = decodedIntermediate_.index(row);
+        values.appendRange(
+            elements,
+            arrayVector->offsetAt(decodedRow),
+            arrayVector->sizeAt(decodedRow),
+            allocator_);
+      }
+    });
+  }
+
+  void destroy(folly::Range<char**> groups) final {
+    for (auto group : groups) {
+      value<ArrayAccumulator>(group)->elements.free(allocator_);
+    }
+  }
+
+ private:
+  vector_size_t countElements(char** groups, int32_t numGroups) const {
+    vector_size_t size = 0;
+    for (int32_t i = 0; i < numGroups; ++i) {
+      size += value<ArrayAccumulator>(groups[i])->elements.size();
+    }
+    return size;
+  }
+
+  // A boolean representing whether to ignore nulls when aggregating inputs.
+  const bool ignoreNulls_;
+  // Reusable instance of DecodedVector for decoding input vectors.
+  DecodedVector decodedElements_;
+  DecodedVector decodedIntermediate_;
+};
+
+template <bool ignoreAllNulls = false>
+void registerArray(const std::string& name, bool withCompanionFunctions) {
+  std::vector<std::shared_ptr<exec::AggregateFunctionSignature>> signatures{
+      exec::AggregateFunctionSignatureBuilder()
+          .typeVariable("E")
+          .returnType("array(E)")
+          .intermediateType("array(E)")
+          .argumentType("E")
+          .build()};
+
+  exec::registerAggregateFunction(
+      name,
+      std::move(signatures),
+      [name](
+          core::AggregationNode::Step step,
+          const std::vector<TypePtr>& argTypes,
+          const TypePtr& resultType,
+          const core::QueryConfig& config) -> std::unique_ptr<exec::Aggregate> {
+        BOLT_CHECK_EQ(
+            argTypes.size(), 1, "{} takes at most one argument", name);
+        return std::make_unique<ArrayAggAggregate<ignoreAllNulls>>(
+            resultType, config.prestoArrayAggIgnoreNulls());
+      },
+      withCompanionFunctions);
+}
+} // namespace
+
+void registerArrayAggregate(
+    const std::string& prefix,
+    bool withCompanionFunctions) {
+  registerArray<false>(prefix + kArrayAgg, withCompanionFunctions);
+}
+
+void registerCollectListAsArrayAggregate(
+    const std::string& prefix,
+    bool withCompanionFunctions) {
+  registerArray<true>(prefix + kCollectList, withCompanionFunctions);
+}
+
+} // namespace bytedance::bolt::aggregate::prestosql

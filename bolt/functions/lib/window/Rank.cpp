@@ -1,0 +1,154 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* --------------------------------------------------------------------------
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * This file has been modified by ByteDance Ltd. and/or its affiliates on
+ * 2025-11-11.
+ *
+ * Original file was released under the Apache License 2.0,
+ * with the full license text available at:
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This modified file is released under the same license.
+ * --------------------------------------------------------------------------
+ */
+
+#include "bolt/common/base/Exceptions.h"
+#include "bolt/exec/WindowFunction.h"
+#include "bolt/expression/FunctionSignature.h"
+#include "bolt/vector/FlatVector.h"
+namespace bytedance::bolt::functions::window {
+
+// Types of rank functions.
+enum class RankType {
+  kRank,
+  kDenseRank,
+  kPercentRank,
+};
+
+namespace {
+
+template <RankType TRank, typename TResult>
+class RankFunction : public exec::WindowFunction {
+ public:
+  explicit RankFunction(const TypePtr& resultType)
+      : WindowFunction(resultType, nullptr, nullptr) {}
+
+  void resetPartition(const exec::WindowPartition* partition) override {
+    rank_ = 1;
+    currentPeerGroupStart_ = 0;
+    previousPeerCount_ = 0;
+    numPartitionRows_ = partition->numRows();
+  }
+
+  void apply(
+      const BufferPtr& peerGroupStarts,
+      const BufferPtr& /*peerGroupEnds*/,
+      const BufferPtr& /*frameStarts*/,
+      const BufferPtr& /*frameEnds*/,
+      const SelectivityVector& validRows,
+      vector_size_t resultOffset,
+      const VectorPtr& result) override {
+    int numRows = peerGroupStarts->size() / sizeof(vector_size_t);
+    auto* rawPeerStarts = peerGroupStarts->as<vector_size_t>();
+    auto rawValues = result->asFlatVector<TResult>()->mutableRawValues();
+
+    for (int i = 0; i < numRows; i++) {
+      auto start = rawPeerStarts[i];
+      if (start != currentPeerGroupStart_) {
+        currentPeerGroupStart_ = start;
+        if constexpr (TRank == RankType::kDenseRank) {
+          if (previousPeerCount_ > 0) {
+            ++rank_;
+          }
+        } else {
+          rank_ += previousPeerCount_;
+        }
+        previousPeerCount_ = 0;
+      }
+
+      if constexpr (TRank == RankType::kPercentRank) {
+        rawValues[resultOffset + i] = (numPartitionRows_ == 1)
+            ? 0
+            : double(rank_ - 1) / (numPartitionRows_ - 1);
+      } else {
+        rawValues[resultOffset + i] = rank_;
+      }
+      previousPeerCount_ += 1;
+    }
+  }
+
+ private:
+  int32_t currentPeerGroupStart_ = 0;
+  int32_t previousPeerCount_ = 0;
+  int64_t rank_ = 1;
+  vector_size_t numPartitionRows_ = 1;
+};
+
+} // namespace
+
+template <RankType TRank, typename TResult>
+void registerRankInternal(
+    const std::string& name,
+    const std::string& returnType) {
+  std::vector<exec::FunctionSignaturePtr> signatures{
+      exec::FunctionSignatureBuilder().returnType(returnType).build(),
+  };
+
+  auto windowFunctionFactory =
+      [name](
+          const std::vector<exec::WindowFunctionArg>& /*args*/,
+          const TypePtr& resultType,
+          bool /*ignoreNulls*/,
+          bolt::memory::MemoryPool* /*pool*/,
+          HashStringAllocator* /*stringAllocator*/,
+          const core::QueryConfig &
+          /*queryConfig*/) -> std::unique_ptr<exec::WindowFunction> {
+    return std::make_unique<RankFunction<TRank, TResult>>(resultType);
+  };
+
+  if constexpr (TRank == RankType::kRank) {
+    exec::registerWindowFunction(
+        name,
+        std::move(signatures),
+        std::move(windowFunctionFactory),
+        {exec::ProcessingUnit::kRows, true, false, false});
+  } else {
+    exec::registerWindowFunction(
+        name, std::move(signatures), std::move(windowFunctionFactory));
+  }
+}
+
+void registerRankBigint(const std::string& name) {
+  registerRankInternal<RankType::kRank, int64_t>(name, "bigint");
+}
+void registerRankInteger(const std::string& name) {
+  registerRankInternal<RankType::kRank, int32_t>(name, "integer");
+}
+void registerDenseRankBigint(const std::string& name) {
+  registerRankInternal<RankType::kDenseRank, int64_t>(name, "bigint");
+}
+void registerDenseRankInteger(const std::string& name) {
+  registerRankInternal<RankType::kDenseRank, int32_t>(name, "integer");
+}
+void registerPercentRank(const std::string& name) {
+  registerRankInternal<RankType::kPercentRank, double>(name, "double");
+}
+
+} // namespace bytedance::bolt::functions::window

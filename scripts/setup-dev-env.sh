@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# --------------------------------------------------------------------------
+# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified by ByteDance Ltd. and/or its affiliates on
+# 2025-11-11.
+#
+# Original file was released under the Apache License 2.0,
+# with the full license text available at:
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# This modified file is released under the same license.
+# --------------------------------------------------------------------------
+
+CUR_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
+
+function check_compiler() {
+    if command -v gcc &> /dev/null; then
+        gcc_version=$(gcc --version | grep -oP '(?<=^gcc \(GCC\) )\d+' | head -n 1)
+
+        if [[ "$gcc_version" -eq 10 || "$gcc_version" -eq 11 || "$gcc_version" -eq 12 ]]; then
+            echo "✅ gcc version：$gcc_version"
+            return 0
+        fi
+    else
+        echo "❌ gcc is not installed"
+    fi
+
+
+    if ! command -v clang &> /dev/null; then
+        echo "❌ clang is not installed"
+        return 1
+    fi
+
+    clang_version=$(clang --version | grep -oP '(?<=^clang version )\d+' | head -n 1)
+
+    if [ "$clang_version" -eq 16 ]; then
+        echo "✅ clang 16 is founded"
+        return 0
+    fi
+    
+    echo "Bolt requires gcc-10/gcc-11/gcc-12/clang-16. Please install the correct compiler version."
+    return 1
+}
+
+function install_and_config_conan() {
+    pip install pydot
+    pip install conan
+
+    if [ -z "$CONAN_HOME" ]; then
+        export CONAN_HOME=~/.conan2
+    fi
+
+    if [ ! -f "${CONAN_HOME}/profiles/default" ]; then
+        conan profile detect
+    fi
+    echo "Configuring conan profile to use gnu C++17 standard by default"
+    sed -i 's/gnu14/gnu17/g' ${CONAN_HOME}/profiles/default
+}
+
+check_compiler
+install_and_config_conan
+
+install_bolt_deps_script="${CUR_DIR}/install-bolt-deps.sh"
+bash "${install_bolt_deps_script}" "$@"

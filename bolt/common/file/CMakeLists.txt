@@ -1,0 +1,58 @@
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# --------------------------------------------------------------------------
+# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified by ByteDance Ltd. and/or its affiliates on
+# 2025-11-11.
+#
+# Original file was released under the Apache License 2.0,
+# with the full license text available at:
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# This modified file is released under the same license.
+# --------------------------------------------------------------------------
+
+
+# for generated headers
+include_directories(.)
+
+add_library(
+  bolt_file
+  File.cpp
+  FileInputStream.cpp
+  FileSystems.cpp
+  Utils.cpp)
+if(KERNEL_SUPPORTS_IO_URING)
+  message(STATUS "Add liburing dependency")
+
+  find_package(liburing REQUIRED)
+  target_link_libraries(
+    bolt_file
+    PUBLIC bolt_exception Folly::folly liburing::liburing
+    PRIVATE bolt_buffer bolt_common_base fmt::fmt glog::glog)
+else()
+  target_link_libraries(
+    bolt_file
+    PUBLIC bolt_exception Folly::folly
+    PRIVATE bolt_buffer bolt_common_base fmt::fmt glog::glog)
+endif()
+
+if(${BOLT_BUILD_TESTING} OR ${BOLT_BUILD_TEST_UTILS})
+  add_subdirectory(tests)
+endif()
+if(${BOLT_ENABLE_BENCHMARKS})
+  add_subdirectory(benchmark)
+endif()

@@ -1,0 +1,161 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* --------------------------------------------------------------------------
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * This file has been modified by ByteDance Ltd. and/or its affiliates on
+ * 2025-11-11.
+ *
+ * Original file was released under the Apache License 2.0,
+ * with the full license text available at:
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This modified file is released under the same license.
+ * --------------------------------------------------------------------------
+ */
+
+#include "bolt/dwio/dwrf/reader/SelectiveRepeatedColumnReader.h"
+#include "bolt/dwio/dwrf/reader/SelectiveDwrfReader.h"
+namespace bytedance::bolt::dwrf {
+namespace {
+std::unique_ptr<dwio::common::IntDecoder</*isSigned*/ false>> makeLengthDecoder(
+    const dwio::common::TypeWithId& fileType,
+    DwrfParams& params,
+    memory::MemoryPool& pool) {
+  EncodingKey encodingKey{fileType.id(), params.flatMapContext().sequence};
+  auto& stripe = params.stripeStreams();
+  auto rleVersion = convertRleVersion(stripe.getEncoding(encodingKey).kind());
+  auto lenId = encodingKey.forKind(proto::Stream_Kind_LENGTH);
+  bool lenVints = stripe.getUseVInts(lenId);
+  return createRleDecoder</*isSigned*/ false>(
+      stripe.getStream(lenId, params.streamLabels().label(), true),
+      rleVersion,
+      pool,
+      lenVints,
+      dwio::common::INT_BYTE_SIZE);
+}
+} // namespace
+
+FlatMapContext flatMapContextFromEncodingKey(EncodingKey& encodingKey) {
+  return FlatMapContext{
+      .sequence = encodingKey.sequence(),
+      .inMapDecoder = nullptr,
+      .keySelectionCallback = nullptr};
+}
+
+SelectiveListColumnReader::SelectiveListColumnReader(
+    const dwio::common::ColumnReaderOptions& columnReaderOptions,
+    const std::shared_ptr<const dwio::common::TypeWithId>& requestedType,
+    const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
+    DwrfParams& params,
+    common::ScanSpec& scanSpec)
+    : dwio::common::SelectiveListColumnReader(
+          requestedType,
+          fileType,
+          params,
+          scanSpec),
+      length_(makeLengthDecoder(*fileType_, params, memoryPool_)) {
+  DWIO_ENSURE_EQ(fileType_->id(), fileType->id(), "working on the same node");
+  EncodingKey encodingKey{fileType_->id(), params.flatMapContext().sequence};
+  auto& stripe = params.stripeStreams();
+  // count the number of selected sub-columns
+  const auto& cs = stripe.getColumnSelector();
+  auto& childType = requestedType_->childAt(0);
+  BOLT_CHECK(
+      cs.shouldReadNode(childType->id()),
+      "SelectiveListColumnReader must select the values stream");
+  if (scanSpec_->children().empty()) {
+    scanSpec.getOrCreateChild(common::ScanSpec::kArrayElementsFieldName);
+  }
+  scanSpec_->children()[0]->setProjectOut(true);
+  scanSpec_->children()[0]->setExtractValues(true);
+
+  auto childParams = DwrfParams(
+      stripe,
+      params.streamLabels(),
+      params.runtimeStatistics(),
+      flatMapContextFromEncodingKey(encodingKey));
+  child_ = SelectiveDwrfReader::build(
+      columnReaderOptions,
+      childType,
+      fileType_->childAt(0),
+      childParams,
+      *scanSpec_->children()[0]);
+  children_ = {child_.get()};
+}
+
+SelectiveMapColumnReader::SelectiveMapColumnReader(
+    const dwio::common::ColumnReaderOptions& columnReaderOptions,
+    const std::shared_ptr<const dwio::common::TypeWithId>& requestedType,
+    const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
+    DwrfParams& params,
+    common::ScanSpec& scanSpec)
+    : dwio::common::SelectiveMapColumnReader(
+          requestedType,
+          fileType,
+          params,
+          scanSpec),
+      length_(makeLengthDecoder(*fileType_, params, memoryPool_)) {
+  DWIO_ENSURE_EQ(fileType_->id(), fileType->id(), "working on the same node");
+  EncodingKey encodingKey{fileType_->id(), params.flatMapContext().sequence};
+  auto& stripe = params.stripeStreams();
+  if (scanSpec_->children().empty()) {
+    scanSpec_->getOrCreateChild(common::ScanSpec::kMapKeysFieldName);
+    scanSpec_->getOrCreateChild(common::ScanSpec::kMapValuesFieldName);
+  }
+  scanSpec_->children()[0]->setProjectOut(true);
+  scanSpec_->children()[0]->setExtractValues(true);
+  scanSpec_->children()[1]->setProjectOut(true);
+  scanSpec_->children()[1]->setExtractValues(true);
+
+  const auto& cs = stripe.getColumnSelector();
+  auto& keyType = requestedType_->childAt(0);
+  BOLT_CHECK(
+      cs.shouldReadNode(keyType->id()),
+      "Map key must be selected in SelectiveMapColumnReader");
+  auto keyParams = DwrfParams(
+      stripe,
+      params.streamLabels(),
+      params.runtimeStatistics(),
+      flatMapContextFromEncodingKey(encodingKey));
+  keyReader_ = SelectiveDwrfReader::build(
+      columnReaderOptions,
+      keyType,
+      fileType_->childAt(0),
+      keyParams,
+      *scanSpec_->children()[0].get());
+
+  auto& valueType = requestedType_->childAt(1);
+  BOLT_CHECK(
+      cs.shouldReadNode(valueType->id()),
+      "Map Values must be selected in SelectiveMapColumnReader");
+  auto elementParams = DwrfParams(
+      stripe,
+      params.streamLabels(),
+      params.runtimeStatistics(),
+      flatMapContextFromEncodingKey(encodingKey));
+  elementReader_ = SelectiveDwrfReader::build(
+      columnReaderOptions,
+      valueType,
+      fileType_->childAt(1),
+      elementParams,
+      *scanSpec_->children()[1]);
+  children_ = {keyReader_.get(), elementReader_.get()};
+}
+
+} // namespace bytedance::bolt::dwrf

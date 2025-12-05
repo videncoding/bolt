@@ -1,0 +1,61 @@
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# --------------------------------------------------------------------------
+# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified by ByteDance Ltd. and/or its affiliates on
+# 2025-11-11.
+#
+# Original file was released under the Apache License 2.0,
+# with the full license text available at:
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# This modified file is released under the same license.
+# --------------------------------------------------------------------------
+
+add_compile_definitions(DISABLE_DUCKDB_REMOTE_INSTALL)
+
+# add_library(
+#   duckdb
+#   duckdb-1.cpp
+#   duckdb-2.cpp
+#   duckdb-3.cpp
+#   duckdb-4.cpp
+#   duckdb-5.cpp
+#   duckdb-6.cpp
+#   duckdb-7.cpp
+#   duckdb-8.cpp
+#   duckdb-fastpforlib.cpp
+#   duckdb-fmt.cpp
+#   duckdb-hyperloglog.cpp
+#   duckdb-libpg_query.cpp
+#   duckdb-miniz.cpp
+#   duckdb-re2.cpp
+#   duckdb-utf8proc.cpp)
+
+add_subdirectory(utils)
+
+add_executable(bolt_exec_prefixsort_test PrefixSortAlgorithmTest.cpp)
+
+add_test(
+  NAME bolt_exec_prefixsort_test
+  COMMAND bolt_exec_prefixsort_test
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+
+set_tests_properties(bolt_exec_prefixsort_test PROPERTIES TIMEOUT 3000)
+
+target_link_libraries(bolt_exec_prefixsort_test bolt_exec_prefixsort_test_lib
+                      bolt_vector_fuzzer bolt_vector_test_lib)

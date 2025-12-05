@@ -1,0 +1,11 @@
+versions:
+  "0.0.5":
+    folder: all      
+  "1.0.1-jsonpath01":
+    folder: all      
+  "1.0.1-jsonpath":
+    folder: all
+  "1.0.1":
+    folder: all
+  "1.0.0":
+    folder: all

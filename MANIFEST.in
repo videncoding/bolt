@@ -1,0 +1,8 @@
+include *.txt
+include *.cmake
+graft CMake
+graft third_party
+graft bolt
+graft pybolt
+graft scripts
+prune bolt/docs

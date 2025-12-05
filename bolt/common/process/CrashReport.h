@@ -1,0 +1,81 @@
+/*
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+namespace bytedance::bolt::process {
+enum class StackTraceEngine {
+  kLibUnwind,
+  kBacktrace,
+  kLibBacktrace,
+};
+/**
+ * Install a crash report signal handler that prints a stack trace
+ * when the program terminates due to a fatal signal (e.g. SIGSEGV).
+ *
+ * @param runInJvm   Whether to check if the current process is running inside a
+ *                     JVM.
+ *                   - The JVM overrides and specially manages signal handlers.
+ *                   - If true, this will verify that libjsig.so has been
+ *                     preloaded (via LD_PRELOAD). If it has not, the handler
+ *                     will not be installed to avoid interfering with JVM
+ *                     behavior.
+ * @param demangle   Whether to demangle C++ symbol names in the stack trace.
+ *                   - Demangling uses abi::__cxa_demangle, which is NOT
+ *                     async-signal-safe.
+ *                   - Should only be enabled in development or debugging
+ *                     builds, never in production.
+ * @param engine    The stack trace engine to use.
+ *                   - kLibUnwind: Uses libunwind to collect the stack trace.
+ *                   - kBacktrace: Uses libbacktrace to collect the stack trace.
+ *                   - kLibBacktrace: Uses libbacktrace to collect the stack
+ *                     trace.
+ */
+void installCrashReportHandler(
+    bool runInJvm = false,
+    bool demangle = false,
+    StackTraceEngine engine = StackTraceEngine::kLibBacktrace);
+/**
+ * A set of async-signal-safe helper functions for writing output directly
+ * to standard output or standard error. These avoid non-signal-safe
+ * library functions (such as printf or std::string) and can therefore
+ * be safely used inside signal handlers.
+ */
+
+/** Write a string of the given length to standard error. */
+void writeToStderr(const char* msg, unsigned long len);
+/** Write a string of the given length to standard output. */
+void writeToStdout(const char* msg, unsigned long len);
+/** Write a null-terminated string to standard error. */
+void writeToStderr(const char* msg);
+/** Write a null-terminated string to standard output. */
+void writeToStdout(const char* msg);
+/**
+ * Write a long integer value to standard output.
+ * @param value  The numeric value to print.
+ * @param base   Number base (default = 10), supported bases are 10 and 16.
+ * @param width  Minimum field width (padded with spaces if necessary,
+ *               -1 means unspecified).
+ */
+void writeToStdout(long value, int base = 10, int width = -1);
+/**
+ * Write a long integer value to standard error.
+ * @param value  The numeric value to print.
+ * @param base   Number base (default = 10), supported bases are 10 and 16.
+ * @param width  Minimum field width (padded with spaces if necessary,
+ *               -1 means unspecified).
+ */
+void writeToStderr(long value, int base = 10, int width = -1);
+} // namespace bytedance::bolt::process

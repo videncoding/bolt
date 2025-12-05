@@ -1,0 +1,498 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* --------------------------------------------------------------------------
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * This file has been modified by ByteDance Ltd. and/or its affiliates on
+ * 2025-11-11.
+ *
+ * Original file was released under the Apache License 2.0,
+ * with the full license text available at:
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This modified file is released under the same license.
+ * --------------------------------------------------------------------------
+ */
+
+#pragma once
+
+#include <folly/container/F14Map.h>
+#include <stdexcept>
+
+#include "bolt/common/base/Exceptions.h"
+#include "bolt/common/base/SimdUtil.h"
+#include "bolt/vector/SimpleVector.h"
+#include "bolt/vector/TypeAliases.h"
+namespace bytedance::bolt {
+
+namespace {
+struct DummyReleaser {
+  void addRef() const {}
+
+  void release() const {}
+};
+} // namespace
+
+template <typename T>
+class ConstantVector final : public SimpleVector<T> {
+ public:
+  ConstantVector(const ConstantVector&) = delete;
+  ConstantVector& operator=(const ConstantVector&) = delete;
+
+  static constexpr bool can_simd =
+      (std::is_same_v<T, int64_t> || std::is_same_v<T, int32_t> ||
+       std::is_same_v<T, int16_t> || std::is_same_v<T, int8_t> ||
+       std::is_same_v<T, bool> || std::is_same_v<T, size_t>);
+
+  ConstantVector(
+      bolt::memory::MemoryPool* pool,
+      size_t length,
+      bool isNull,
+      TypePtr type,
+      T&& val,
+      const SimpleVectorStats<T>& stats = {},
+      std::optional<ByteCount> representedBytes = std::nullopt,
+      std::optional<ByteCount> storageByteCount = std::nullopt)
+      : SimpleVector<T>(
+            pool,
+            type,
+            VectorEncoding::Simple::CONSTANT,
+            BufferPtr(nullptr),
+            length,
+            stats,
+            isNull ? 0 : 1 /* distinctValueCount */,
+            isNull ? length : 0 /* nullCount */,
+            true /*isSorted*/,
+            representedBytes,
+            storageByteCount),
+        value_(std::move(val)),
+        isNull_(isNull),
+        initialized_(true) {
+    makeNullsBuffer();
+    // Special handling for complex types
+    if (type->size() > 0) {
+      // Only allow null constants to be created through this interface.
+      BOLT_CHECK(isNull_);
+      valueVector_ = BaseVector::create(type, 1, pool);
+      valueVector_->setNull(0, true);
+    }
+    if constexpr (std::is_same_v<T, StringView>) {
+      if (!isNull_) {
+        // Copy string value.
+        setValue(value_.str());
+      }
+    }
+    // If this is not encoded integer, or string, set value buffer
+    if constexpr (can_simd) {
+      valueBuffer_ = simd::setAll(value_);
+    }
+  }
+
+  // Creates constant vector with value coming from 'index' element of the
+  // 'base' vector. Base vector can be flat or lazy vector. Base vector cannot
+  // be a constant or dictionary vector. Use BaseVector::wrapInConstant to
+  // automatically peel off encodings of the base vector.
+  //
+  // If base vector is lazy and has not been loaded yet, loading will be delayed
+  // until loadedVector() is called.
+  ConstantVector(
+      bolt::memory::MemoryPool* pool,
+      vector_size_t length,
+      vector_size_t index,
+      VectorPtr base,
+      const SimpleVectorStats<T>& stats = {})
+      : SimpleVector<T>(
+            pool,
+            base->type(),
+            VectorEncoding::Simple::CONSTANT,
+            BufferPtr(nullptr),
+            length,
+            stats,
+            std::nullopt,
+            std::nullopt,
+            true /*isSorted*/,
+            base->representedBytes().has_value()
+                ? std::optional<ByteCount>(
+                      (base->representedBytes().value() / base->size()) *
+                      length)
+                : std::nullopt /* representedBytes */),
+        valueVector_(base),
+        index_(index) {
+    BOLT_CHECK_NE(
+        base->BaseVector::encoding(),
+        VectorEncoding::Simple::CONSTANT,
+        "Constant vector cannot wrap Constant vector");
+    BOLT_CHECK_NE(
+        base->BaseVector::encoding(),
+        VectorEncoding::Simple::DICTIONARY,
+        "Constant vector cannot wrap Dictionary vector");
+    setInternalState();
+  }
+
+  virtual ~ConstantVector() override = default;
+
+  bool isNullAt(vector_size_t /*idx*/) const override {
+    BOLT_DCHECK(initialized_);
+    return isNull_;
+  }
+
+  bool mayHaveNulls() const override {
+    BOLT_DCHECK(initialized_);
+    return isNull_;
+  }
+
+  bool mayHaveNullsRecursive() const override {
+    BOLT_DCHECK(initialized_);
+    return isNull_ || (valueVector_ && valueVector_->mayHaveNullsRecursive());
+  }
+
+  void setNull(vector_size_t /*idx*/, bool /*value*/) override {
+    BOLT_FAIL("setNull not supported on ConstantVector");
+  }
+
+  const T value() const {
+    BOLT_DCHECK(initialized_);
+    return value_;
+  }
+
+  const T valueAtFast(vector_size_t /*idx*/) const {
+    return value();
+  }
+
+  vector_size_t itemSize() const override {
+    return 1;
+  }
+
+  virtual const T valueAt(vector_size_t /*idx*/) const override {
+    BOLT_DCHECK(initialized_);
+    SimpleVector<T>::checkElementSize();
+    return value();
+  }
+
+  BufferPtr getStringBuffer() const {
+    BOLT_DCHECK(initialized_);
+    return stringBuffer_;
+  }
+
+  const T* rawValues() const {
+    BOLT_DCHECK(initialized_);
+    return &value_;
+  }
+
+  const void* valuesAsVoid() const override {
+    BOLT_DCHECK(initialized_);
+    return &value_;
+  }
+
+  /**
+   * Loads a 256bit vector of data at the virtual byteOffset given
+   * Note this method is implemented on each vector type, but is intentionally
+   * not virtual for performance reasons
+   *
+   * @param byteOffset - the byte offset to laod from
+   */
+  xsimd::batch<T> loadSIMDValueBufferAt(size_t /* byteOffset */) const {
+    BOLT_DCHECK(initialized_);
+    return valueBuffer_;
+  }
+
+  std::unique_ptr<SimpleVector<uint64_t>> hashAll() const override;
+
+  uint64_t retainedSize() const override {
+    BOLT_DCHECK(initialized_);
+    if (valueVector_) {
+      return valueVector_->retainedSize();
+    }
+    if (stringBuffer_) {
+      return stringBuffer_->capacity();
+    }
+    return sizeof(T);
+  }
+
+  uint64_t usedSize() const override {
+    BOLT_DCHECK(initialized_);
+    if (valueVector_) {
+      return valueVector_->usedSize();
+    }
+    if (stringBuffer_) {
+      return stringBuffer_->size();
+    }
+    return sizeof(T);
+  }
+
+  uint64_t estimateExportArrowSize() const override {
+    BOLT_DCHECK(initialized_);
+    loadedVector();
+    auto exportSize = BaseVector::estimateExportArrowSize();
+    size_t valueSize = sizeof(T);
+    if constexpr (std::is_same_v<T, StringView>) {
+      valueSize = value_.size();
+    } else {
+      if (BaseVector::type()->isFixedWidth()) {
+        valueSize = getArrowElementSize(BaseVector::type());
+      }
+    }
+    exportSize += valueSize * BaseVector::size();
+    return exportSize;
+  }
+
+  BaseVector* loadedVector() override {
+    if (!valueVector_) {
+      return this;
+    }
+    auto loaded = BaseVector::loadedVectorShared(valueVector_);
+    if (loaded == valueVector_) {
+      return this;
+    }
+    valueVector_ = loaded;
+    setInternalState();
+    return this;
+  }
+
+  const BaseVector* loadedVector() const override {
+    return const_cast<ConstantVector<T>*>(this)->loadedVector();
+  }
+
+  bool isScalar() const override {
+    return valueVector_ ? valueVector_->isScalar()
+                        : (this->typeKind() != TypeKind::UNKNOWN);
+  }
+
+  const BaseVector* wrappedVector() const override {
+    return valueVector_ ? valueVector_->wrappedVector() : this;
+  }
+
+  vector_size_t wrappedIndex(vector_size_t /*index*/) const override {
+    return valueVector_ ? valueVector_->wrappedIndex(index_) : 0;
+  }
+
+  BufferPtr wrapInfo() const override {
+    static const DummyReleaser kDummy;
+    return BufferView<DummyReleaser>::create(
+        reinterpret_cast<const uint8_t*>(&index_),
+        sizeof(vector_size_t),
+        kDummy);
+  }
+
+  // Base vector if isScalar() is false (e.g. complex type vector) or if base
+  // vector is a lazy vector that hasn't been loaded yet.
+  const VectorPtr& valueVector() const override {
+    return valueVector_;
+  }
+
+  // Index of the element of the base vector that determines the value of this
+  // constant vector.
+  vector_size_t index() const {
+    return index_;
+  }
+
+  void resize(vector_size_t newSize, bool /*setNotNull*/ = true) override {
+    BaseVector::length_ = newSize;
+    if constexpr (std::is_same_v<T, StringView>) {
+      SimpleVector<StringView>::resizeIsAsciiIfNotEmpty(
+          newSize, SimpleVector<StringView>::getAllIsAscii());
+    }
+  }
+
+  VectorPtr slice(vector_size_t /*offset*/, vector_size_t length)
+      const override {
+    BOLT_DCHECK(initialized_);
+    if (valueVector_) {
+      return std::make_shared<ConstantVector<T>>(
+          this->pool_, length, index_, valueVector_);
+    } else {
+      return std::make_shared<ConstantVector<T>>(
+          this->pool_, length, isNull_, this->type_, T(value_));
+    }
+  }
+
+  void addNulls(const uint64_t* /*bits*/, const SelectivityVector& /*rows*/)
+      override {
+    BOLT_FAIL("addNulls not supported");
+  }
+
+  bool containsNullAt(vector_size_t idx) const override {
+    if constexpr (std::is_same_v<T, ComplexType>) {
+      if (isNullAt(idx)) {
+        return true;
+      }
+
+      return valueVector_->containsNullAt(index_);
+    } else {
+      return isNullAt(idx);
+    }
+  }
+
+  void addNulls(const SelectivityVector& /*rows*/) override {
+    BOLT_FAIL("addNulls not supported");
+  }
+
+  std::optional<int32_t> compare(
+      const BaseVector* other,
+      vector_size_t index,
+      vector_size_t otherIndex,
+      CompareFlags flags) const override {
+    if constexpr (!std::is_same_v<T, ComplexType>) {
+      if (other->isConstantEncoding()) {
+        auto otherConstant = other->asUnchecked<ConstantVector<T>>();
+        if (isNull_ || otherConstant->isNull_) {
+          return BaseVector::compareNulls(
+              isNull_, otherConstant->isNull_, flags);
+        }
+
+        auto result =
+            SimpleVector<T>::comparePrimitiveAsc(value_, otherConstant->value_);
+        return flags.ascending ? result : result * -1;
+      }
+    }
+
+    return SimpleVector<T>::compare(other, index, otherIndex, flags);
+  }
+
+  std::string toString() const {
+    if (valueVector_) {
+      return valueVector_->toString(index_);
+    }
+
+    if (isNull_) {
+      return "null";
+    } else {
+      return SimpleVector<T>::valueToString(value());
+    }
+  }
+
+  std::string toString(vector_size_t /*index*/) const override {
+    return toString();
+  }
+
+  bool isNullsWritable() const override {
+    return false;
+  }
+
+  void validate(const VectorValidateOptions& options) const override {
+    // Do not call BaseVector's validate() since the nulls buffer has
+    // a fixed size for constant vectors.
+    if (options.callback) {
+      options.callback(*this);
+    }
+    if (valueVector_ != nullptr) {
+      if (!isNull_) {
+        BOLT_CHECK_LT(index_, valueVector_->size());
+      }
+      valueVector_->validate(options);
+    }
+  }
+
+ protected:
+  std::string toSummaryString() const override {
+    std::stringstream out;
+    out << "[" << BaseVector::encoding() << " "
+        << BaseVector::type()->toString() << ": " << BaseVector::size()
+        << " elements, " << toString() << "]";
+
+    return out.str();
+  }
+
+ private:
+  void setInternalState() {
+    if (isLazyNotLoaded(*valueVector_)) {
+      BOLT_CHECK(
+          valueVector_->markAsContainingLazyAndWrapped(),
+          "An unloaded lazy vector cannot be wrapped by two different "
+          "top level vectors.");
+      // Do not load Lazy vector
+      return;
+    }
+    // Ensure any internal state in valueVector_ is initialized, and it points
+    // to the loaded vector underneath any lazy layers.
+    valueVector_ = BaseVector::loadedVectorShared(valueVector_);
+
+    isNull_ = valueVector_->isNullAt(index_);
+    BaseVector::distinctValueCount_ = isNull_ ? 0 : 1;
+    const vector_size_t vectorSize = BaseVector::length_;
+    BaseVector::nullCount_ = isNull_ ? vectorSize : 0;
+    if (valueVector_->isScalar()) {
+      auto simple = valueVector_->loadedVector()->as<SimpleVector<T>>();
+      isNull_ = simple->isNullAt(index_);
+      if (!isNull_) {
+        value_ = simple->valueAt(index_);
+        if constexpr (std::is_same_v<T, StringView>) {
+          // Copy string value.
+          StringView* valuePtr = reinterpret_cast<StringView*>(&value_);
+          setValue(std::string(valuePtr->data(), valuePtr->size()));
+
+          auto stringVector = simple->template as<SimpleVector<StringView>>();
+          if (auto ascii = stringVector->isAscii(index_)) {
+            SimpleVector<T>::setAllIsAscii(ascii.value());
+          }
+        }
+      }
+      valueVector_ = nullptr;
+    }
+    makeNullsBuffer();
+    initialized_ = true;
+  }
+
+  void setValue(const std::string& string) {
+    BaseVector::inMemoryBytes_ += string.size();
+    value_ = bolt::to<decltype(value_)>(string);
+    if constexpr (can_simd) {
+      valueBuffer_ = simd::setAll(value_);
+    }
+  }
+
+  void makeNullsBuffer() {
+    if (!isNull_) {
+      return;
+    }
+    BaseVector::nulls_ =
+        AlignedBuffer::allocate<uint64_t>(1, BaseVector::pool());
+    BaseVector::nulls_->setSize(1);
+    BaseVector::rawNulls_ = BaseVector::nulls_->as<uint64_t>();
+    *BaseVector::nulls_->asMutable<uint64_t>() = bits::kNull64;
+  }
+
+  // 'valueVector_' element 'index_' represents a complex constant
+  // value. 'valueVector_' is nullptr if the constant is scalar.
+  VectorPtr valueVector_;
+  // The index of the represented value in 'valueVector_'.
+  vector_size_t index_ = 0;
+  // Holds the memory for backing non-inlined values represented by StringView.
+  BufferPtr stringBuffer_;
+  T value_;
+  bool isNull_ = false;
+  bool initialized_{false};
+
+  // This must be at end to avoid memory corruption.
+  std::conditional_t<can_simd, xsimd::batch<T>, char> valueBuffer_;
+};
+
+template <>
+void ConstantVector<StringView>::setValue(const std::string& string);
+
+template <>
+void ConstantVector<std::shared_ptr<void>>::setValue(const std::string& string);
+
+template <>
+void ConstantVector<ComplexType>::setValue(const std::string& string);
+
+template <typename T>
+using ConstantVectorPtr = std::shared_ptr<ConstantVector<T>>;
+
+} // namespace bytedance::bolt
+
+#include "bolt/vector/ConstantVector-inl.h"

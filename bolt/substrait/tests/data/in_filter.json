@@ -1,0 +1,90 @@
+{
+    "relations": [
+        {
+            "root": {
+                "input": {
+                    "read": {
+                        "common": {
+                            "direct": {}
+                        },
+                        "baseSchema": {
+                            "names": [
+                                "ps_partkey",
+                                "ps_suppkey",
+                                "ps_availqty",
+                                "ps_supplycost",
+                                "ps_comment"
+                            ],
+                            "struct": {
+                                "types": [
+                                    {
+                                        "i64": {
+                                            "nullability": "NULLABILITY_NULLABLE"
+                                        }
+                                    },
+                                    {
+                                        "i64": {
+                                            "nullability": "NULLABILITY_NULLABLE"
+                                        }
+                                    },
+                                    {
+                                        "i32": {
+                                            "nullability": "NULLABILITY_NULLABLE"
+                                        }
+                                    },
+                                    {
+                                        "fp64": {
+                                            "nullability": "NULLABILITY_NULLABLE"
+                                        }
+                                    },
+                                    {
+                                        "string": {
+                                            "nullability": "NULLABILITY_NULLABLE"
+                                        }
+                                    }
+                                ]
+                            },
+                            "partitionColumns": {
+                                "columnType": [
+                                    "NORMAL_COL",
+                                    "NORMAL_COL",
+                                    "NORMAL_COL",
+                                    "NORMAL_COL",
+                                    "NORMAL_COL"
+                                ]
+                            }
+                        },
+                        "filter": {
+                            "singularOrList": {
+                                "value": {
+                                    "selection": {
+                                        "directReference": {
+                                            "structField": {}
+                                        }
+                                    }
+                                },
+                                "options": [
+                                    {
+                                        "literal": {
+                                            "i64": "1552"
+                                        }
+                                    },
+                                    {
+                                        "literal": {
+                                            "i64": "674"
+                                        }
+                                    },
+                                    {
+                                        "literal": {
+                                            "i64": "1062"
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    ]
+}

@@ -1,0 +1,200 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* --------------------------------------------------------------------------
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * This file has been modified by ByteDance Ltd. and/or its affiliates on
+ * 2025-11-11.
+ *
+ * Original file was released under the Apache License 2.0,
+ * with the full license text available at:
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This modified file is released under the same license.
+ * --------------------------------------------------------------------------
+ */
+
+#pragma once
+
+#include "bolt/dwio/common/SelectiveColumnReaderInternal.h"
+#include "bolt/dwio/dwrf/common/DecoderUtil.h"
+#include "bolt/dwio/dwrf/reader/DwrfData.h"
+namespace bytedance::bolt::dwrf {
+
+class SelectiveStringDictionaryColumnReader
+    : public dwio::common::SelectiveColumnReader {
+ public:
+  using ValueType = int32_t;
+
+  SelectiveStringDictionaryColumnReader(
+      const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
+      DwrfParams& params,
+      common::ScanSpec& scanSpec);
+
+  void seekToRowGroup(int64_t index) override {
+    SelectiveColumnReader::seekToRowGroup(index);
+    auto positionsProvider = formatData_->as<DwrfData>().seekToRowGroup(index);
+    if (strideDictStream_) {
+      strideDictStream_->seekToPosition(positionsProvider);
+      strideDictLengthDecoder_->seekToRowGroup(positionsProvider);
+      // skip row group dictionary size
+      positionsProvider.next();
+    }
+
+    dictIndex_->seekToRowGroup(positionsProvider);
+
+    if (inDictionaryReader_) {
+      inDictionaryReader_->seekToRowGroup(positionsProvider);
+    }
+
+    BOLT_CHECK(!positionsProvider.hasNext());
+  }
+
+  uint64_t skip(uint64_t numValues) override;
+
+  bool hasBulkPath() const override {
+    if (version_ == bolt::dwrf::RleVersion_1) {
+      return true;
+    } else {
+      return false; // RLEv2 does't support FastPath yet
+    }
+  }
+
+  void read(int64_t offset, const RowSet& rows, const uint64_t* incomingNulls)
+      override;
+
+  void getValues(const RowSet& rows, VectorPtr* result) override;
+
+ private:
+  void loadStrideDictionary();
+  void makeDictionaryBaseVector();
+
+  template <typename TVisitor>
+  void readWithVisitor(const RowSet& rows, TVisitor visitor);
+
+  template <typename TFilter, bool isDense, typename ExtractValues>
+  void
+  readHelper(common::Filter* filter, const RowSet& rows, ExtractValues values);
+
+  template <bool isDense, typename ExtractValues>
+  void processFilter(
+      common::Filter* filter,
+      RowSet rows,
+      ExtractValues extractValues);
+
+  // Fills 'values' from 'data' and 'lengthDecoder'. The count of
+  // values is in 'values.numValues'.
+  void loadDictionary(
+      dwio::common::SeekableInputStream& data,
+      dwio::common::IntDecoder</*isSigned*/ false>& lengthDecoder,
+      dwio::common::DictionaryValues& values);
+  void ensureInitialized();
+
+  void makeFlat(VectorPtr* result);
+
+  std::unique_ptr<dwio::common::IntDecoder</*isSigned*/ false>> dictIndex_;
+  std::unique_ptr<ByteRleDecoder> inDictionaryReader_;
+  std::unique_ptr<dwio::common::SeekableInputStream> strideDictStream_;
+  std::unique_ptr<dwio::common::IntDecoder</*isSigned*/ false>>
+      strideDictLengthDecoder_;
+
+  FlatVectorPtr<StringView> dictionaryValues_;
+
+  int64_t lastStrideIndex_;
+  size_t positionOffset_;
+  size_t strideDictSizeOffset_;
+  RleVersion version_;
+
+  const StrideIndexProvider& provider_;
+  dwio::common::ColumnReaderStatistics& statistics_;
+
+  // lazy load the dictionary
+  std::unique_ptr<dwio::common::IntDecoder</*isSigned*/ false>> lengthDecoder_;
+  std::unique_ptr<dwio::common::SeekableInputStream> blobStream_;
+  bool initialized_{false};
+  int64_t numRowsScanned_;
+};
+
+template <typename TVisitor>
+void SelectiveStringDictionaryColumnReader::readWithVisitor(
+    const RowSet& rows,
+    TVisitor visitor) {
+  if (version_ == bolt::dwrf::RleVersion_1) {
+    decodeWithVisitor<bolt::dwrf::RleDecoderV1<false>>(
+        dictIndex_.get(), visitor);
+  } else {
+    decodeWithVisitor<bolt::dwrf::RleDecoderV2<false>>(
+        dictIndex_.get(), visitor);
+  }
+}
+
+template <typename TFilter, bool isDense, typename ExtractValues>
+void SelectiveStringDictionaryColumnReader::readHelper(
+    common::Filter* FOLLY_NULLABLE filter,
+    const RowSet& rows,
+    ExtractValues values) {
+  readWithVisitor(
+      rows,
+      dwio::common::
+          StringDictionaryColumnVisitor<TFilter, ExtractValues, isDense>(
+              *reinterpret_cast<TFilter*>(filter), this, rows, values));
+}
+
+template <bool isDense, typename ExtractValues>
+void SelectiveStringDictionaryColumnReader::processFilter(
+    common::Filter* filter,
+    RowSet rows,
+    ExtractValues extractValues) {
+  switch (filter ? filter->kind() : common::FilterKind::kAlwaysTrue) {
+    case common::FilterKind::kAlwaysTrue:
+      readHelper<common::AlwaysTrue, isDense>(filter, rows, extractValues);
+      break;
+    case common::FilterKind::kIsNull:
+      filterNulls<int32_t>(
+          rows,
+          true,
+          !std::is_same_v<decltype(extractValues), dwio::common::DropValues>);
+      break;
+    case common::FilterKind::kIsNotNull:
+      if (std::is_same_v<decltype(extractValues), dwio::common::DropValues>) {
+        filterNulls<int32_t>(rows, false, false);
+      } else {
+        readHelper<common::IsNotNull, isDense>(filter, rows, extractValues);
+      }
+      break;
+    case common::FilterKind::kBytesRange:
+      readHelper<common::BytesRange, isDense>(filter, rows, extractValues);
+      break;
+    case common::FilterKind::kNegatedBytesRange:
+      readHelper<common::NegatedBytesRange, isDense>(
+          filter, rows, extractValues);
+      break;
+    case common::FilterKind::kBytesValues:
+      readHelper<common::BytesValues, isDense>(filter, rows, extractValues);
+      break;
+    case common::FilterKind::kNegatedBytesValues:
+      readHelper<common::NegatedBytesValues, isDense>(
+          filter, rows, extractValues);
+      break;
+    default:
+      readHelper<common::Filter, isDense>(filter, rows, extractValues);
+      break;
+  }
+}
+
+} // namespace bytedance::bolt::dwrf

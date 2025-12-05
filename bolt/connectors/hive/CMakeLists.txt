@@ -1,0 +1,123 @@
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License. You may obtain a copy of
+# the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations under
+# the License.
+# --------------------------------------------------------------------------
+# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified by ByteDance Ltd. and/or its affiliates on
+# 2025-11-11.
+#
+# Original file was released under the Apache License 2.0,
+# with the full license text available at:
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# This modified file is released under the same license.
+# --------------------------------------------------------------------------
+
+
+add_library(bolt_hive_config OBJECT HiveConfig.cpp)
+
+target_link_libraries(bolt_hive_config bolt_exception)
+
+add_library(
+  bolt_hive_connector
+  FileHandle.cpp
+  HiveConfig.cpp
+  HiveConnector.cpp
+  HiveConnectorUtil.cpp
+  HiveConnectorSplit.cpp
+  PaimonConnectorSplit.cpp
+  PaimonMiscHelpers.cpp
+  HiveDataSink.cpp
+  HiveDataSource.cpp
+  HivePartitionUtil.cpp
+  PartitionIdGenerator.cpp
+  HiveSplitReaderBase.cpp
+  SplitReader.cpp
+  PaimonSplitReader.cpp
+  paimon_merge_engines/DeduplicateEngine.cpp
+  paimon_merge_engines/AggregateEngine.cpp
+  paimon_merge_engines/PartialUpdateEngine.cpp
+  paimon_merge_engines/PaimonRowKind.cpp
+  PaimonRowIterator.cpp
+  TableHandle.cpp
+  )
+
+set(enabled_dwio_formats "")
+if(BOLT_ENABLE_ORC)
+  list(APPEND enabled_dwio_formats
+          bolt_dwio_orc_reader
+          bolt_dwio_orc_writer
+  )
+endif()
+if(BOLT_ENABLE_PARQUET)
+  list(APPEND enabled_dwio_formats
+          bolt_dwio_parquet_reader
+          bolt_dwio_parquet_writer
+  )
+endif()
+
+if(BOLT_ENABLE_TXT)
+  list(APPEND enabled_dwio_formats
+          bolt_dwio_txt_reader
+          bolt_dwio_txt_writer
+  )
+endif()
+
+set(enabled_filesystems "")
+
+if(BOLT_ENABLE_S3)
+  list(APPEND enabled_filesystems "bolt_s3fs")
+endif()
+if(BOLT_ENABLE_GCS)
+  list(APPEND enabled_filesystems "bolt_gcs")
+endif()
+if(BOLT_ENABLE_HDFS)
+  list(APPEND enabled_filesystems "bolt_hdfs")
+endif()
+if(BOLT_ENABLE_ABFS)
+  list(APPEND enabled_filesystems "bolt_abfs")
+endif()
+
+target_link_libraries(
+  bolt_hive_connector
+  PUBLIC
+  bolt_common_io
+  bolt_connector
+  bolt_dwio_catalog_fbhive
+  bolt_dwio_dwrf_reader
+  bolt_dwio_dwrf_writer
+  bolt_dwio_orc_reader
+  bolt_dwio_parquet_reader
+  bolt_dwio_parquet_writer
+  ${enabled_filesystems}
+  ${enabled_dwio_formats}
+  bolt_dwio_paimon_deletion_vector_reader
+  bolt_file
+  bolt_hive_partition_function
+  arrow::arrow)
+
+add_library(bolt_hive_partition_function HivePartitionFunction.cpp)
+
+target_link_libraries(bolt_hive_partition_function bolt_core bolt_exec)
+
+add_subdirectory(storage_adapters)
+
+if(${BOLT_BUILD_TESTING})
+  add_subdirectory(tests)
+endif()
+
+if(${BOLT_ENABLE_BENCHMARKS})
+  add_subdirectory(benchmarks)
+endif()

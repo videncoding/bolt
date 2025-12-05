@@ -1,0 +1,101 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* --------------------------------------------------------------------------
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * This file has been modified by ByteDance Ltd. and/or its affiliates on
+ * 2025-11-11.
+ *
+ * Original file was released under the Apache License 2.0,
+ * with the full license text available at:
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This modified file is released under the same license.
+ * --------------------------------------------------------------------------
+ */
+
+#pragma once
+
+#include "CheckedArithmeticImpl.h"
+#include "bolt/common/base/Exceptions.h"
+namespace bytedance::bolt::functions {
+
+template <typename T>
+struct CheckedPlusFunction {
+  template <typename TInput>
+  FOLLY_ALWAYS_INLINE void
+  call(TInput& result, const TInput& a, const TInput& b) {
+    result = checkedPlus(a, b);
+  }
+};
+
+template <typename T>
+struct CheckedMinusFunction {
+  template <typename TInput>
+  FOLLY_ALWAYS_INLINE void
+  call(TInput& result, const TInput& a, const TInput& b) {
+    result = checkedMinus(a, b);
+  }
+};
+
+template <typename T>
+struct CheckedMultiplyFunction {
+  template <typename TInput>
+  FOLLY_ALWAYS_INLINE void
+  call(TInput& result, const TInput& a, const TInput& b) {
+    result = checkedMultiply(a, b);
+  }
+};
+
+template <typename T>
+struct CheckedDivideFunction {
+  template <typename TInput>
+  FOLLY_ALWAYS_INLINE void
+  call(TInput& result, const TInput& a, const TInput& b) {
+    result = checkedDivide(a, b);
+  }
+};
+
+template <typename T>
+struct CheckedModulusFunction {
+  template <typename TInput>
+  FOLLY_ALWAYS_INLINE bool
+  call(TInput& result, const TInput& a, const TInput& b) {
+    auto res = checkedModulus(a, b);
+    // When any number mod 0, spark's logic returns null, while presto's logic
+    // throws an exception, so using `SPARK_COMPATIBLE` macro to constrain the
+    // behavior of both
+    if (UNLIKELY(!res.has_value())) {
+#ifdef SPARK_COMPATIBLE
+      return false;
+#endif
+      BOLT_ARITHMETIC_ERROR("Cannot divide by 0");
+    }
+    result = *res;
+    return true;
+  }
+};
+
+template <typename T>
+struct CheckedNegateFunction {
+  template <typename TInput>
+  FOLLY_ALWAYS_INLINE void call(TInput& result, const TInput& a) {
+    result = checkedNegate(a);
+  }
+};
+
+} // namespace bytedance::bolt::functions

@@ -1,0 +1,149 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* --------------------------------------------------------------------------
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * This file has been modified by ByteDance Ltd. and/or its affiliates on
+ * 2025-11-11.
+ *
+ * Original file was released under the Apache License 2.0,
+ * with the full license text available at:
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This modified file is released under the same license.
+ * --------------------------------------------------------------------------
+ */
+
+#include "bolt/exec/WindowFunction.h"
+#include "bolt/expression/FunctionSignature.h"
+#include "bolt/expression/SignatureBinder.h"
+namespace bytedance::bolt::exec {
+
+WindowFunctionMap& windowFunctions() {
+  static WindowFunctionMap functions;
+  return functions;
+}
+
+namespace {
+std::optional<const WindowFunctionEntry*> getWindowFunctionEntry(
+    const std::string& name) {
+  auto& functionsMap = windowFunctions();
+  auto it = functionsMap.find(name);
+  if (it != functionsMap.end()) {
+    return &it->second;
+  }
+
+  return std::nullopt;
+}
+} // namespace
+
+bool registerWindowFunction(
+    const std::string& name,
+    std::vector<FunctionSignaturePtr> signatures,
+    WindowFunctionFactory factory,
+    StreamingProcessMetadata metadata) {
+  auto sanitizedName = sanitizeName(name);
+  windowFunctions()[sanitizedName] = {
+      std::move(signatures), std::move(factory), metadata};
+  return true;
+}
+
+std::optional<StreamingProcessMetadata> getWindowFunctionMetadata(
+    const std::string& name) {
+  auto sanitizedName = sanitizeName(name);
+  if (auto func = getWindowFunctionEntry(sanitizedName)) {
+    return func.value()->metadata;
+  }
+  return std::nullopt;
+}
+
+std::optional<std::vector<FunctionSignaturePtr>> getWindowFunctionSignatures(
+    const std::string& name) {
+  auto sanitizedName = sanitizeName(name);
+  if (auto func = getWindowFunctionEntry(sanitizedName)) {
+    return func.value()->signatures;
+  }
+  return std::nullopt;
+}
+
+std::unique_ptr<WindowFunction> WindowFunction::create(
+    const std::string& name,
+    const std::vector<WindowFunctionArg>& args,
+    const TypePtr& resultType,
+    bool ignoreNulls,
+    memory::MemoryPool* pool,
+    HashStringAllocator* stringAllocator,
+    const core::QueryConfig& config) {
+  // Lookup the function in the new registry first.
+  if (auto func = getWindowFunctionEntry(name)) {
+    std::vector<TypePtr> argTypes;
+    argTypes.reserve(args.size());
+    for (const auto& arg : args) {
+      argTypes.push_back(arg.type);
+    }
+
+    const auto& signatures = func.value()->signatures;
+    for (auto& signature : signatures) {
+      SignatureBinder binder(*signature, argTypes);
+      if (binder.tryBind()) {
+        auto type = binder.tryResolveType(signature->returnType());
+        BOLT_USER_CHECK(
+            type->equivalent(*resultType),
+            "Unexpected return type for window function {}. Expected {}. Got {}.",
+            toString(name, argTypes),
+            type->toString(),
+            resultType->toString())
+        return func.value()->factory(
+            args, resultType, ignoreNulls, pool, stringAllocator, config);
+      }
+    }
+
+    BOLT_USER_FAIL(
+        "Window function signature is not supported: {}. Supported signatures: {}.",
+        toString(name, argTypes),
+        toString(signatures));
+  }
+
+  BOLT_USER_FAIL("Window function not registered: {}", name);
+}
+
+void WindowFunction::setEmptyFramesResult(
+    const SelectivityVector& validRows,
+    vector_size_t resultOffset,
+    const VectorPtr& defaultResult,
+    const VectorPtr& result) {
+  if (validRows.isAllSelected()) {
+    return;
+  }
+  // Set the null bit for all rows to true if the defaultResult is NULL and
+  // there are no valid rows.
+  if (!validRows.hasSelections() && defaultResult->isNullAt(0)) {
+    uint64_t* rawNulls = result->mutableRawNulls();
+    bits::fillBits(
+        rawNulls, resultOffset, resultOffset + validRows.size(), bits::kNull);
+    return;
+  }
+
+  invalidRows_.resizeFill(validRows.size(), true);
+  invalidRows_.deselect(validRows);
+  invalidRows_.applyToSelected([&](auto i) {
+    result->copy(defaultResult.get(), resultOffset + i, 0, 1);
+  });
+}
+
+} // namespace bytedance::bolt::exec

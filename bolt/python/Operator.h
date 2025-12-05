@@ -1,0 +1,70 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* --------------------------------------------------------------------------
+ * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * This file has been modified by ByteDance Ltd. and/or its affiliates on
+ * 2025-11-11.
+ *
+ * Original file was released under the Apache License 2.0,
+ * with the full license text available at:
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This modified file is released under the same license.
+ * --------------------------------------------------------------------------
+ */
+#pragma once
+
+#include <pybind11/pytypes.h>
+#include <mutex>
+
+#include "bolt/exec/Operator.h"
+
+namespace bolt::python {
+class PythonOperator : public bytedance::bolt::exec::Operator {
+ public:
+  ~PythonOperator() override {}
+  PythonOperator(
+      std::string functionName,
+      pybind11::function function,
+      pybind11::args args,
+      pybind11::kwargs kwargs,
+      bytedance::bolt::RowTypePtr outputType,
+      int32_t operatorId,
+      bytedance::bolt::exec::DriverCtx* driverCtx,
+      std::string planNodeId,
+      std::optional<bytedance::bolt::common::SpillConfig> spillConfig =
+          std::nullopt);
+
+  // Operator methods override
+  bool needsInput() const override;
+  void addInput(bytedance::bolt::RowVectorPtr input) override;
+  void noMoreInput() override;
+  bytedance::bolt::exec::BlockingReason isBlocked(
+      bytedance::bolt::ContinueFuture* future) override;
+  bytedance::bolt::RowVectorPtr getOutput() override;
+  bool isFinished() override;
+
+ private:
+  std::string functionName_;
+  std::mutex mtx_;
+  std::deque<bytedance::bolt::RowVectorPtr> inputs_;
+  pybind11::function function_;
+  pybind11::args args_;
+  pybind11::kwargs kwargs_;
+};
+} // namespace bolt::python
