@@ -27,6 +27,7 @@ services:
       - RUNNER_NAME=runner-large
       - RUNNER_LABELS=large
       - GITHUB_RUNNER_TOKEN=${RUNNER_LARGE_TOKEN}
+    privileged: true
     deploy:
       resources:
         limits:
@@ -37,6 +38,7 @@ services:
     extends:
       service: base-runner
       file: runner-base-compose.yml
+    privileged: true
     environment:
       - RUNNER_NAME=runner-medium-1
       - RUNNER_LABELS=medium
@@ -51,6 +53,7 @@ services:
     extends:
       service: base-runner
       file: runner-base-compose.yml
+    privileged: true
     environment:
       - RUNNER_NAME=runner-medium-2
       - RUNNER_LABELS=medium
@@ -65,6 +68,7 @@ services:
     extends:
       service: base-runner
       file: runner-base-compose.yml
+    privileged: true
     environment:
       - RUNNER_NAME=runner-small
       - RUNNER_LABELS=small

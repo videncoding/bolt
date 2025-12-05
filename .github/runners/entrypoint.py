@@ -25,6 +25,9 @@ def main():
     
     # allow running as root
     os.environ["RUNNER_ALLOW_RUNASROOT"] = "1"
+    
+    # starting docker
+    os.system("service docker start")
 
     print("Configuring the runner...")
     # Execute /actions-runner/config.sh with the token and labels
