@@ -1,0 +1,84 @@
+services:
+  ci-image:
+    build:
+      context: .
+      dockerfile: Dockerfile.ci
+      tags: 
+        - bolt-ci:latest
+    command: bash -c "Bolt CI Image"
+  conan_server:
+    build:
+      context: .
+      dockerfile: Dockerfile.conanserver
+    env_file:
+      - variables.env
+    ports:
+      - "9300:9300"
+    volumes:
+      - /tmp/conan-server:/var/conan/data:rw
+    networks:
+      - default
+    
+  runner-large:
+    extends:
+      service: base-runner
+      file: runner-base-compose.yml
+    environment:
+      - RUNNER_NAME=runner-large
+      - RUNNER_LABELS=large
+      - GITHUB_RUNNER_TOKEN=${RUNNER_LARGE_TOKEN}
+    deploy:
+      resources:
+        limits:
+          cpus: '32.0'
+          memory: 128G
+
+  runner-medium-1:
+    extends:
+      service: base-runner
+      file: runner-base-compose.yml
+    environment:
+      - RUNNER_NAME=runner-medium-1
+      - RUNNER_LABELS=medium
+      - GITHUB_RUNNER_TOKEN=${RUNNER_MEDIUM_1_TOKEN}
+    deploy:
+      resources:
+        limits:
+          cpus: '16.0'
+          memory: 48G
+
+  runner-medium-2:
+    extends:
+      service: base-runner
+      file: runner-base-compose.yml
+    environment:
+      - RUNNER_NAME=runner-medium-2
+      - RUNNER_LABELS=medium
+      - GITHUB_RUNNER_TOKEN=${RUNNER_MEDIUM_2_TOKEN}
+    deploy:
+      resources:
+        limits:
+          cpus: '16.0'
+          memory: 48G
+
+  runner-small:
+    extends:
+      service: base-runner
+      file: runner-base-compose.yml
+    environment:
+      - RUNNER_NAME=runner-small
+      - RUNNER_LABELS=small
+      - GITHUB_RUNNER_TOKEN=${RUNNER_SMALL_TOKEN}
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+
+volumes:
+  actions-cache:
+    driver: local
+    driver_opts:
+      o: bind
+      type: none
+      device: /tmp/actions-cache

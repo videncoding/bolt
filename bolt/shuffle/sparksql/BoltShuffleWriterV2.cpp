@@ -92,8 +92,7 @@ arrow::Status BoltShuffleWriterV2::split(
     batches_.emplace_back(rv);
     // when BoltMemoryManager is enabled, memLimit is lower than what we got in
     // Java, so we make threshold lower to store more batches.
-    double ratio =
-        memory::sparksql::ExecutionMemoryPool::inited() ? 0.5 : 0.25;
+    double ratio = memory::sparksql::ExecutionMemoryPool::inited() ? 0.5 : 0.25;
     if (options_.enableVectorCombination &&
         (!hasComplexType_ ||
          numBytesInBatches_ < maxCombinedBytesWithComplexType_) &&

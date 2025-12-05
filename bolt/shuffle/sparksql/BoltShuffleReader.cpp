@@ -39,9 +39,9 @@
 #include "arrow/c/bridge.h"
 #include "arrow/c/helpers.h"
 #include "bolt/serializers/PrestoSerializer.h"
+#include "bolt/shuffle/sparksql/BoltArrowMemoryPool.h"
 #include "bolt/shuffle/sparksql/Payload.h"
 #include "bolt/shuffle/sparksql/Utils.h"
-#include "bolt/shuffle/sparksql/BoltArrowMemoryPool.h"
 #include "bolt/shuffle/sparksql/compression/Compression.h"
 #include "bolt/vector/ComplexVector.h"
 #include "bolt/vector/FlatVector.h"
@@ -420,8 +420,7 @@ RowVectorPtr BoltColumnarBatchDeserializer::next() {
   if (vectorLayout_ == RowVectorLayout::kInvalid) {
     int64_t bytes = 0;
     auto result = BlockPayload::getVectorLayout(in_.get(), type, bytes);
-    BOLT_CHECK(
-        result.ok(), "Failed to get vector layout: " + result.message());
+    BOLT_CHECK(result.ok(), "Failed to get vector layout: " + result.message());
     BOLT_CHECK(bytes != 0, "bytes should not be zero");
     if (type == static_cast<uint8_t>(RowVectorLayout::kComposite)) {
       vectorLayout_ = RowVectorLayout::kComposite;
@@ -679,8 +678,7 @@ RowVectorPtr BoltColumnarBatchDeserializer::nextFromRows() {
   return nullptr;
 }
 
-bool BoltColumnarBatchDeserializer::isCompositeRowVectorLayout(
-    int64_t& bytes) {
+bool BoltColumnarBatchDeserializer::isCompositeRowVectorLayout(int64_t& bytes) {
   uint8_t type;
   if (readAheadBuffer_.size >= sizeof(Payload::Type)) {
     bytes = sizeof(Payload::Type);
@@ -688,8 +686,7 @@ bool BoltColumnarBatchDeserializer::isCompositeRowVectorLayout(
     readAheadBuffer_.advance(bytes);
   } else {
     auto status = BlockPayload::getVectorLayout(in_.get(), type, bytes);
-    BOLT_CHECK(
-        status.ok(), "Failed to get vector layout: " + status.message());
+    BOLT_CHECK(status.ok(), "Failed to get vector layout: " + status.message());
     if (bytes == 0) {
       // Reach EOS.
       return false;
@@ -810,8 +807,7 @@ bytedance::bolt::TypePtr fromBoltTypeToArrowSchema(
     const std::shared_ptr<arrow::Schema>& schema) {
   ArrowSchema cSchema;
   auto status = arrow::ExportSchema(*schema, &cSchema);
-  BOLT_CHECK(
-      status.ok(), "Failed to export Arrow schema: " + status.message());
+  BOLT_CHECK(status.ok(), "Failed to export Arrow schema: " + status.message());
   bytedance::bolt::TypePtr typePtr = bytedance::bolt::importFromArrow(cSchema);
   // It should be bolt::importFromArrow's duty to release the imported arrow c
   // schema. Since exported Bolt type prt doesn't hold memory from the c
