@@ -14,7 +14,7 @@ services:
     ports:
       - "9300:9300"
     volumes:
-      - /tmp/conan-server:/var/conan/data:rw
+      - ./conan-server-data:/var/conan/data:rw
     networks:
       - default
   bolt-registry:
@@ -22,7 +22,7 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - /tmp/registry:/var/lib/registry:rw
+      - ./registry:/var/lib/registry:rw
   runner-large:
     extends:
       service: base-runner
