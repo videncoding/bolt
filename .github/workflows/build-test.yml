@@ -9,6 +9,7 @@ on:
 env:
   CONAN_HOME: '/root/.conan2'
   CCACHE_DIR: '/tmp/.ccache'
+  CCACHE_MAX_SIZE: '100G'
 
 jobs:
   build-test:
