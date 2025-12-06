@@ -18,6 +18,7 @@ jobs:
       uses: actions/checkout@v6
     - name: Add CI conan remote
       run: |
+        source ~/.profile
         conan remote add ci https://bolt-registry:9300 --insert 0
       
     - name: Install Bolt dependencies
