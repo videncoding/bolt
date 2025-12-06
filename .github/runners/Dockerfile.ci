@@ -23,6 +23,7 @@ RUN arch=$(arch) && \
     curl -L -# -o /tmp/cmake.tar.gz https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-linux-${arch}.tar.gz  && \
     tar -xzvf /tmp/cmake.tar.gz -C /opt && \
     ln -s /opt/cmake-$CMAKE_VERSION-linux-${arch}/bin/cmake /usr/local/bin/cmake && \
+    ln -s /opt/cmake-$CMAKE_VERSION-linux-${arch}/bin/ctest /usr/local/bin/ctest && \
     rm /tmp/cmake.tar.gz
 
 # Install vim, sudo, git, gdb, python3, pip, ssh, ninja, bison, maven
